@@ -350,6 +350,30 @@ def test_load_gives_up_with_clear_error_when_all_models_stay_busy(env, monkeypat
     assert created == [], "the new model was loaded anyway"
 
 
+def test_two_waiting_loads_of_one_model_load_it_once(env, monkeypatch):
+    """Open WebUI sends the chat and its title task together. With all slots
+    busy both loads wait; when a slot frees up, the first loads the model and
+    the second must use it, not unload it to load it again (log 2026-11-13)."""
+    _limit_models(env, monkeypatch, 1)
+    created = []
+    _use_fake_workers(env, monkeypatch, created)
+    _loaded(env, "busy", 1, 5)
+    assert env.manager.begin_request("busy")
+
+    first, first_outcome = _start_load(env, "qwen-0.8b")
+    second, second_outcome = _start_load(env, "qwen-0.8b")
+    first.join(0.3)
+    assert first.is_alive() and second.is_alive(), "the loads did not wait for the busy model"
+
+    env.manager.end_request("busy")
+    first.join(5)
+    second.join(5)
+
+    assert first_outcome == second_outcome == {"result": True}, (first_outcome, second_outcome)
+    assert len(created) == 1, f"the model was loaded {len(created)} times"
+    assert set(env.manager.workers) == {"qwen-0.8b"}
+
+
 # --- running requests keep their model busy -----------------------------------------
 
 def test_inference_pipe_keeps_model_busy_until_closed(env, monkeypatch):
