@@ -717,9 +717,12 @@ class WorkerManager:
         # it both see "not loaded", pick the same free NPU domain and either both
         # fail (out of domain memory) or both load, and the second replaces the
         # first in self.workers, leaving an untracked worker holding NPU memory.
-        self._load_lock = threading.Lock()
+        # A Condition (re-entrant lock underneath) so a load waiting for a free NPU
+        # domain can sleep until a request finishes or a model is unloaded.
+        self._load_lock = threading.Condition()
 
-        # Running requests per model (model name -> count)
+        # Running requests per model (model name -> count). A model with a running
+        # request is never unloaded to free an NPU domain for another model.
         self._busy = {}
 
         # Reap any orphaned workers left behind by a previous rkllama run
@@ -1012,23 +1015,65 @@ class WorkerManager:
             return True
 
     def end_request(self, model_name) -> None:
-        """Undo one begin_request."""
+        """Undo one begin_request and wake loads waiting for an idle model."""
         with self._load_lock:
             count = self._busy.get(model_name, 0) - 1
             if count > 0:
                 self._busy[model_name] = count
             else:
                 self._busy.pop(model_name, None)
+            self._load_lock.notify_all()
 
     def is_busy(self, model_name) -> bool:
         """True while the model has at least one running request."""
         return self._busy.get(model_name, 0) > 0
 
+    def _domain_wait_timeout(self) -> int:
+        return int(rkllama.config.get("model", "max_seconds_waiting_worker_response"))
+
+    def _least_recently_used_idle_llm(self):
+        """Name of the least recently used RKLLM/GGUF worker without running requests, or None.
+        Only these hold NPU domains >= 1 (RKNN models share domain 0)."""
+        candidates = [
+            worker.worker_model_info for name, worker in self.workers.items()
+            if any(domain != 0 for domain in worker.worker_model_info.base_domain_id) and not self.is_busy(name)
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=attrgetter('last_call')).model
+
+    def _wait_for_free_domains(self, model_name) -> list:
+        """Return the free NPU domains for a new RKLLM/GGUF worker. When all
+        max_number_models_loaded_in_memory domains are taken, unload the least
+        recently used idle model; if every loaded model is busy, wait until one
+        finishes or is unloaded. Caller must hold self._load_lock."""
+        deadline = time.monotonic() + self._domain_wait_timeout()
+        while True:
+            free_domains = self.get_available_base_domain_id(reverse_order=True)
+            if free_domains:
+                return free_domains
+
+            victim = self._least_recently_used_idle_llm()
+            if victim is not None:
+                logger.info(f"All NPU domains in use: unloading least recently used idle model {victim} to load {model_name}")
+                self.stop_worker(victim)
+                continue
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                limit = rkllama.config.get("model", "max_number_models_loaded_in_memory")
+                raise RuntimeError(
+                    f"Cannot load model '{model_name}': all {limit} model slots (max_number_models_loaded_in_memory) "
+                    f"are taken by models with running requests, waited {self._domain_wait_timeout()} seconds. Try again later."
+                )
+            logger.info(f"All NPU domains in use by busy models: model {model_name} waits for one to finish")
+            self._load_lock.wait(timeout=remaining)
+
     def _create_worker(self, model_name, model_path, model_dir, options, lora_model_path, prompt_cache_path, loaded_by) -> bool:
         """Create and register the worker for a model. Caller must hold self._load_lock."""
         if is_rkllm_model(model_name) or is_gguf_model(model_name):
-            # Get the available domain id for the RKLLM process
-            base_domain_ids = self.get_available_base_domain_id(reverse_order=True)
+            # Get the available domain ids for the RKLLM/GGUF process (unloads or waits if all are taken)
+            base_domain_ids = self._wait_for_free_domains(model_name)
         else:
             # RKNNLite library doesnt allow to specify base domain id
             base_domain_ids = [0]
@@ -1228,6 +1273,17 @@ class WorkerManager:
 
 
     def stop_worker(self, model_name, timeout=30):
+        """
+        Stop/Unload a model worker (see _stop_worker_unlocked). Serialized with
+        model loads, and wakes loads waiting for a free NPU domain.
+        """
+        with self._load_lock:
+            try:
+                self._stop_worker_unlocked(model_name, timeout)
+            finally:
+                self._load_lock.notify_all()
+
+    def _stop_worker_unlocked(self, model_name, timeout=30):
         """
         Stop/Unload a model worker. Sends an unload command and waits up to
         ``timeout`` seconds for the worker process to exit. If the process

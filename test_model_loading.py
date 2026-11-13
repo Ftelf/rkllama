@@ -12,6 +12,11 @@ RAM check: the free-RAM test before a load added psutil's `free` to
 `available`, which already includes it, so the least recently used model
 was evicted too late or not at all.
 
+NPU domains exhausted: with all max_number_models_loaded_in_memory domains
+taken, the next load crashed with IndexError (base_domain_ids[0]). Now it
+unloads the least recently used idle model, or waits while all are busy.
+Running requests keep their model busy, so it is not unloaded mid-answer.
+
 Uses the fake-module harness from test_worker_pipe_guard.py (no NPU, no
 ctypes runtime).
 """
@@ -235,6 +240,114 @@ def test_domain_allocator_offers_every_domain_up_to_the_limit(env, monkeypatch):
     assert env.manager.get_available_base_domain_id(reverse_order=False) == [1, 2, 3]
     _loaded(env, "a", 2, 1)
     assert env.manager.get_available_base_domain_id(reverse_order=False) == [1, 3]
+
+
+# --- full NPU domains: unload the least recently used idle model, wait while all are busy
+
+def _start_load(env, name):
+    """add_worker in a daemon thread; returns (thread, outcome dict)."""
+    outcome = {}
+
+    def load():
+        try:
+            outcome["result"] = env.manager.add_worker(name, f"{name}.rkllm", "dir")
+        except Exception as e:  # noqa: BLE001 - the test inspects it
+            outcome["error"] = e
+
+    thread = threading.Thread(target=load, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def test_full_domains_unload_least_recently_used_idle_llm(env, monkeypatch):
+    _limit_models(env, monkeypatch, 2)
+    created = []
+    _use_fake_workers(env, monkeypatch, created)
+    _loaded(env, "tts", 0, 120)       # RKNN model on domain 0: oldest, but holds no LLM domain
+    _loaded(env, "old", 2, 30)
+    _loaded(env, "new", 1, 1)
+
+    assert env.manager.add_worker("third", "third.rkllm", "dir") is True
+
+    assert set(env.manager.workers) == {"tts", "new", "third"}, set(env.manager.workers)
+    assert created[0].worker_model_info.base_domain_id == [2], "the new model did not get the freed domain"
+
+
+def test_limit_one_swaps_models(env, monkeypatch):
+    _limit_models(env, monkeypatch, 1)
+    created = []
+    _use_fake_workers(env, monkeypatch, created)
+    _loaded(env, "qwen-2b", 1, 5)
+
+    assert env.manager.add_worker("qwen-4b", "4b.rkllm", "dir") is True
+
+    assert set(env.manager.workers) == {"qwen-4b"}
+    assert created[0].worker_model_info.base_domain_id == [1]
+
+
+def test_busy_model_is_not_unloaded_even_if_least_recently_used(env, monkeypatch):
+    _limit_models(env, monkeypatch, 2)
+    created = []
+    _use_fake_workers(env, monkeypatch, created)
+    _loaded(env, "old-busy", 2, 30)
+    _loaded(env, "new-idle", 1, 1)
+    assert env.manager.begin_request("old-busy")
+
+    assert env.manager.add_worker("third", "third.rkllm", "dir") is True
+
+    assert set(env.manager.workers) == {"old-busy", "third"}, "a model with a running request was unloaded"
+
+
+def test_load_waits_while_all_models_are_busy_then_proceeds(env, monkeypatch):
+    _limit_models(env, monkeypatch, 1)
+    created = []
+    _use_fake_workers(env, monkeypatch, created)
+    _loaded(env, "a", 1, 5)
+    assert env.manager.begin_request("a")
+
+    thread, outcome = _start_load(env, "b")
+    thread.join(0.3)
+    assert thread.is_alive(), f"load did not wait for the busy model: {outcome}"
+    assert set(env.manager.workers) == {"a"}
+
+    env.manager.end_request("a")  # the running answer finishes
+    thread.join(5)
+    assert not thread.is_alive(), "load did not wake up when the busy model became idle"
+    assert outcome == {"result": True}, outcome
+    assert set(env.manager.workers) == {"b"}
+
+
+def test_unloading_a_model_wakes_a_waiting_load(env, monkeypatch):
+    """A domain freed by the monitor (expired model) or the unload API must wake a waiting load."""
+    _limit_models(env, monkeypatch, 1)
+    created = []
+    _use_fake_workers(env, monkeypatch, created)
+    _loaded(env, "a", 1, 5)
+    assert env.manager.begin_request("a")
+
+    thread, outcome = _start_load(env, "b")
+    thread.join(0.3)
+    assert thread.is_alive(), f"load did not wait for the busy model: {outcome}"
+
+    env.manager.stop_worker("a")
+    thread.join(5)
+    assert not thread.is_alive(), "load did not wake up when a model was unloaded"
+    assert outcome == {"result": True}, outcome
+
+
+def test_load_gives_up_with_clear_error_when_all_models_stay_busy(env, monkeypatch):
+    _limit_models(env, monkeypatch, 1)
+    created = []
+    _use_fake_workers(env, monkeypatch, created)
+    monkeypatch.setattr(env.manager, "_domain_wait_timeout", lambda: 0.2)
+    _loaded(env, "a", 1, 5)
+    assert env.manager.begin_request("a")
+
+    with pytest.raises(RuntimeError, match="model slots"):
+        env.manager.add_worker("b", "b.rkllm", "dir")
+
+    assert set(env.manager.workers) == {"a"}, "the busy model was unloaded"
+    assert created == [], "the new model was loaded anyway"
 
 
 # --- running requests keep their model busy -----------------------------------------
