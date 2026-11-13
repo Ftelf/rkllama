@@ -1042,13 +1042,19 @@ class WorkerManager:
             return None
         return min(candidates, key=attrgetter('last_call')).model
 
-    def _wait_for_free_domains(self, model_name) -> list:
+    def _wait_for_free_domains(self, model_name):
         """Return the free NPU domains for a new RKLLM/GGUF worker. When all
         max_number_models_loaded_in_memory domains are taken, unload the least
         recently used idle model; if every loaded model is busy, wait until one
-        finishes or is unloaded. Caller must hold self._load_lock."""
+        finishes or is unloaded. Returns None if a concurrent request loaded
+        this model meanwhile. Caller must hold self._load_lock."""
         deadline = time.monotonic() + self._domain_wait_timeout()
         while True:
+            if model_name in self.workers:
+                # Another request for the same model waited too and loaded it first:
+                # unloading it to load it again would only cost the load time
+                return None
+
             free_domains = self.get_available_base_domain_id(reverse_order=True)
             if free_domains:
                 return free_domains
@@ -1074,6 +1080,8 @@ class WorkerManager:
         if is_rkllm_model(model_name) or is_gguf_model(model_name):
             # Get the available domain ids for the RKLLM/GGUF process (unloads or waits if all are taken)
             base_domain_ids = self._wait_for_free_domains(model_name)
+            if base_domain_ids is None:
+                return True
         else:
             # RKNNLite library doesnt allow to specify base domain id
             base_domain_ids = [0]
