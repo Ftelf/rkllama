@@ -64,7 +64,7 @@ A server to run and interact with LLM models optimized for Rockchip RK3588(S) an
     * Load the model after new request (if not in memory already)
     * Unload when model expires after inactivity (default 30 min)
     * Unload the oldest model in memory if new model is required to be loaded and there is not memory available in the server
-    * 
+    * At most `max_number_models_loaded_in_memory` RKLLM/GGUF models (default 9) are loaded at once. Requesting another one unloads the least recently used model that is not answering a request; if all are busy, the load waits for one to finish (up to `max_seconds_waiting_worker_response`). Set it to 1 to run one model at a time
 - **Automatically Prompt Cache file saving for each chat sessions of the same llm model:**
     * Allow fast response in large context chat sessions when swiching between them for the same model. Usefull if you are using a model in Openclaw (large context chat sessions) and other agents or tools (like OpenWebui) with the same model without affecting performance in any chat session.
     * Allow to restore previous chat sessions for fast inference even if the model was unloaded previously from memory
