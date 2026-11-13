@@ -15,6 +15,7 @@ was evicted too late or not at all.
 Uses the fake-module harness from test_worker_pipe_guard.py (no NPU, no
 ctypes runtime).
 """
+import gc
 import signal
 import threading
 import time
@@ -234,3 +235,64 @@ def test_domain_allocator_offers_every_domain_up_to_the_limit(env, monkeypatch):
     assert env.manager.get_available_base_domain_id(reverse_order=False) == [1, 2, 3]
     _loaded(env, "a", 2, 1)
     assert env.manager.get_available_base_domain_id(reverse_order=False) == [1, 3]
+
+
+# --- running requests keep their model busy -----------------------------------------
+
+def test_inference_pipe_keeps_model_busy_until_closed(env, monkeypatch):
+    _loaded(env, "m", 1, 5)
+
+    conn = env.manager.inference("m", [1, 2, 3], None, {})
+    assert env.manager.is_busy("m"), "a running inference does not mark the model busy"
+    assert env.manager.workers["m"].task_queue.items, "the task never reached the worker queue"
+
+    conn.close()
+    assert not env.manager.is_busy("m")
+
+
+def test_closing_a_pipe_twice_does_not_release_another_running_request(env, monkeypatch):
+    """Readers may close twice (error path, then timeout path). A second release
+    would mark the model idle while another request on it still runs, so a swap
+    could unload it mid-answer."""
+    _loaded(env, "m", 1, 5)
+    first = env.manager.inference("m", [1], None, {})
+    second = env.manager.inference("m", [2], None, {})
+
+    first.close()
+    first.close()
+    assert env.manager.is_busy("m"), "double close released the other running request"
+
+    second.close()
+    assert not env.manager.is_busy("m")
+
+
+def test_abandoned_pipe_releases_model_when_garbage_collected(env, monkeypatch):
+    """A reader that never closes (client gone mid-stream, exception) must not
+    pin the model as busy forever: it would block every later swap."""
+    _loaded(env, "m", 1, 5)
+
+    conn = env.manager.inference("m", [1, 2, 3], None, {})
+    assert env.manager.is_busy("m")
+    del conn
+    gc.collect()
+    assert not env.manager.is_busy("m"), "an abandoned pipe kept the model busy"
+
+
+def test_request_on_unloaded_model_fails_cleanly(env, monkeypatch):
+    with pytest.raises(RuntimeError, match="not loaded"):
+        env.manager.inference("gone", [1], None, {})
+    assert env.manager._busy == {}
+    assert env.manager.begin_request("gone") is False
+
+
+def test_failure_before_send_releases_model(env, monkeypatch):
+    """E.g. the vision encoder fails before a multimodal task is sent."""
+    _loaded(env, "m", 1, 5)
+
+    def encoder_fails():
+        raise RuntimeError("Unexpected error encoding image")
+
+    with pytest.raises(RuntimeError, match="encoding image"):
+        env.manager._send_tracked_task("m", lambda prepared: ("TASK", prepared), before_send=encoder_fails)
+    assert not env.manager.is_busy("m")
+    assert env.manager.workers["m"].task_queue.items == [], "a task was sent although its preparation failed"

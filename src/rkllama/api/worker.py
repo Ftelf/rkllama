@@ -672,6 +672,41 @@ def run_rknn_process(name, task, model_input):
         return None
 
 
+class TrackedConnection:
+    """Parent end of a request pipe that keeps its model marked busy until closed.
+
+    Readers already close the pipe on finish, worker error and timeout. A reader
+    that never does (client gone mid-stream, exception) still releases the model
+    when this object is garbage collected, so a lost request cannot pin the model
+    as busy forever.
+    """
+
+    def __init__(self, conn, release):
+        self._conn = conn
+        self._release = release
+
+    def __getattr__(self, name):
+        # poll / recv / fileno / ... go to the real connection
+        return getattr(self._conn, name)
+
+    def _release_once(self):
+        release, self._release = self._release, None
+        if release is not None:
+            release()
+
+    def close(self):
+        try:
+            self._conn.close()
+        finally:
+            self._release_once()
+
+    def __del__(self):
+        try:
+            self._release_once()
+        except Exception:
+            pass
+
+
 # Class to manage the workers for RKLLM models
 class WorkerManager:
     def __init__(self):
@@ -683,6 +718,9 @@ class WorkerManager:
         # fail (out of domain memory) or both load, and the second replaces the
         # first in self.workers, leaving an untracked worker holding NPU memory.
         self._load_lock = threading.Lock()
+
+        # Running requests per model (model name -> count)
+        self._busy = {}
 
         # Reap any orphaned workers left behind by a previous rkllama run
         # (e.g. SIGKILL, power loss). Without this, restarting the server
@@ -964,6 +1002,28 @@ class WorkerManager:
                 return True
             return self._create_worker(model_name, model_path, model_dir, options, lora_model_path, prompt_cache_path, loaded_by)
 
+    def begin_request(self, model_name) -> bool:
+        """Mark a model busy for one request. Returns False if it is not loaded
+        (e.g. unloaded for another model just before this request started)."""
+        with self._load_lock:
+            if model_name not in self.workers:
+                return False
+            self._busy[model_name] = self._busy.get(model_name, 0) + 1
+            return True
+
+    def end_request(self, model_name) -> None:
+        """Undo one begin_request."""
+        with self._load_lock:
+            count = self._busy.get(model_name, 0) - 1
+            if count > 0:
+                self._busy[model_name] = count
+            else:
+                self._busy.pop(model_name, None)
+
+    def is_busy(self, model_name) -> bool:
+        """True while the model has at least one running request."""
+        return self._busy.get(model_name, 0) > 0
+
     def _create_worker(self, model_name, model_path, model_dir, options, lora_model_path, prompt_cache_path, loaded_by) -> bool:
         """Create and register the worker for a model. Caller must hold self._load_lock."""
         if is_rkllm_model(model_name) or is_gguf_model(model_name):
@@ -1127,6 +1187,23 @@ class WorkerManager:
         return None
 
     
+    def _send_tracked_task(self, model_name, task, before_send=None):
+        """send_task for a request whose result the caller reads from the returned
+        pipe: the model stays busy until that pipe is closed. ``before_send`` runs
+        first inside the busy window (e.g. the vision encoder of a multimodal
+        request). Raises RuntimeError if the model is not loaded."""
+        if not self.begin_request(model_name):
+            raise RuntimeError(f"Model '{model_name}' is not loaded (it may have been unloaded for another model). Try again.")
+        try:
+            prepared = before_send() if before_send is not None else None
+            parent_conn = self.send_task(model_name, task(prepared) if callable(task) else task)
+            if parent_conn is None:
+                raise RuntimeError(f"Model '{model_name}' is not loaded. Try again.")
+        except BaseException:
+            self.end_request(model_name)
+            raise
+        return TrackedConnection(parent_conn, lambda: self.end_request(model_name))
+
     def update_last_call_for_model(self, model_name):
         """
         Update the metadata of a worker with the last time called
@@ -1251,8 +1328,8 @@ class WorkerManager:
             # Construct model input
             model_input = (prompt_input, prompt_cache_file)
             
-            # Send the inference task
-            parent_conn = self.send_task(model_name, (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_TOKEN, model_input, options))
+            # Send the inference task (model stays busy until the returned pipe is closed)
+            parent_conn = self._send_tracked_task(model_name, (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_TOKEN, model_input, options))
             
             # Clear the cache to save memory. Load Prompt caching file is enable before the new inference
             self.clear_cache_worker(model_name)
@@ -1260,7 +1337,7 @@ class WorkerManager:
             # Return the request parent pipe connection
             return parent_conn
 
-        return None
+        raise RuntimeError(f"Model '{model_name}' is not loaded (it may have been unloaded for another model). Try again.")
 
 
     def embedding(self, model_name, text_input, prompt_cache_file = None, options = None):
@@ -1280,12 +1357,13 @@ class WorkerManager:
             model_input = (text_input, prompt_cache_file)
 
             # Send the embedding task
-            parent_conn = self.send_task(model_name, (WORKER_TASK_EMBEDDING,RKLLMInferMode.RKLLM_INFER_GET_LAST_HIDDEN_LAYER, RKLLMInputType.RKLLM_INPUT_PROMPT, model_input, options))        
+            parent_conn = self._send_tracked_task(model_name, (WORKER_TASK_EMBEDDING,RKLLMInferMode.RKLLM_INFER_GET_LAST_HIDDEN_LAYER, RKLLMInputType.RKLLM_INPUT_PROMPT, model_input, options))        
             
             # Return the request parent pipe connection
             return parent_conn
 
-    
+        raise RuntimeError(f"Model '{model_name}' is not loaded (it may have been unloaded for another model). Try again.")
+
     def multimodal(self, model_name, prompt_input, images, prompt_cache_file, options, video = None):
         """
         Send a inference task to the corresponding model worker for multimodal input
@@ -1318,20 +1396,25 @@ class WorkerManager:
             n_image_tokens = int(get_property_modelfile(model_name, 'N_IMAGE_TOKENS', rkllama.config.get_path("models"))) 
             num_images = len(images)
 
-            # Prepare the image input embed for multimodal
-            image_embed  =  self.get_images_embed(model_name, model_encoder_path, images, image_width, image_height)
+            def encode_images():
+                # Prepare the image input embed for multimodal (runs in the worker, so inside the busy window)
+                image_embed  =  self.get_images_embed(model_name, model_encoder_path, images, image_width, image_height)
 
-            # Check if the image was encoded correctly
-            if image_embed is None:
-                # Error encoding the image. Return
-                raise RuntimeError(f"Unexpected error encoding image for model : {model_name}")
-            
-            # Prepare all the inputs for the multimodal inference. For now only image
-            #model_input = (prompt_input, image_embed, n_image_tokens, image_width, image_height, num_images, video_embed, n_frame_per_video, frame_width, frame_height, n_video, prompt_cache_file)
-            model_input = (prompt_input, image_embed, n_image_tokens, image_width, image_height, num_images, None, None, None, None, None, prompt_cache_file)
-            
-            # Send the inference task
-            parent_conn = self.send_task(model_name, (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_MULTIMODAL, model_input, options))
+                # Check if the image was encoded correctly
+                if image_embed is None:
+                    # Error encoding the image. Return
+                    raise RuntimeError(f"Unexpected error encoding image for model : {model_name}")
+
+                # Prepare all the inputs for the multimodal inference. For now only image
+                #model_input = (prompt_input, image_embed, n_image_tokens, image_width, image_height, num_images, video_embed, n_frame_per_video, frame_width, frame_height, n_video, prompt_cache_file)
+                return (prompt_input, image_embed, n_image_tokens, image_width, image_height, num_images, None, None, None, None, None, prompt_cache_file)
+
+            # Send the inference task (model stays busy from the image encoding until the returned pipe is closed)
+            parent_conn = self._send_tracked_task(
+                model_name,
+                lambda model_input: (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_MULTIMODAL, model_input, options),
+                before_send=encode_images,
+            )
             
             # Clear the cache to save memory. Load Prompt caching file is enable before the new inference
             self.clear_cache_worker(model_name)
@@ -1339,7 +1422,7 @@ class WorkerManager:
             # Return the request parent pipe connection
             return parent_conn
 
-        return None
+        raise RuntimeError(f"Model '{model_name}' is not loaded (it may have been unloaded for another model). Try again.")
 
 
     def get_images_embed(self, model_name, model_encoder_path, images, image_width, image_height) -> None:

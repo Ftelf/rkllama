@@ -1582,6 +1582,12 @@ def forward_request_to_llama_cpp_worker(is_openai_request,request):
     gguf_full_path = Path(get_gguf_model_path(model_name))
     data['model'] =  gguf_full_path.name
 
+    # Keep the model busy until the proxied response is done, so a load of another
+    # model cannot unload it to free its NPU domains mid-answer
+    if not variables.worker_manager_rkllm.begin_request(model_name):
+        return jsonify({"error": f"Model '{model_name}' was unloaded to make room for another model before this request started. Try again."}), 503
+    released_by_stream = False
+
     # Make the request for llama.cpp
     proxy_route_url = f"http://localhost:{variables.worker_manager_rkllm.workers[model_name].worker_model_info.llama_cpp_port}{final_request_path}"
     logger.debug(f"Routing request to llama.cpp whith this URL: {proxy_route_url} with this data:\n{data}")
@@ -1652,8 +1658,15 @@ def forward_request_to_llama_cpp_worker(is_openai_request,request):
                         }
                     }) + "\n"    
 
+            def generate_and_release():
+                try:
+                    yield from generate()
+                finally:
+                    variables.worker_manager_rkllm.end_request(model_name)
+
             logger.debug("Making the streaming call to llama-server...")
-            return Response(stream_with_context(generate()), mimetype="text/event-stream") # OpenAI
+            released_by_stream = True
+            return Response(stream_with_context(generate_and_release()), mimetype="text/event-stream") # OpenAI
 
         else:
             # Not stream response
@@ -1681,6 +1694,9 @@ def forward_request_to_llama_cpp_worker(is_openai_request,request):
     except Exception as e:
         logger.error(f"Error routing to llama-server: {e}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if not released_by_stream:
+            variables.worker_manager_rkllm.end_request(model_name)
 
 
 # Default route
