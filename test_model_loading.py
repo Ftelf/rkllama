@@ -189,3 +189,48 @@ def test_add_worker_evicts_least_recently_used_model_until_ram_fits(env, monkeyp
     assert env.manager.add_worker("qwen-4b", "4b.rkllm", "dir") is True
     assert evicted == ["oldest"], f"evicted {evicted}, expected only the least recently used model"
     assert set(env.manager.workers) == {"newest", "middle", "qwen-4b"}
+
+
+# --- NPU domains (max_number_models_loaded_in_memory) ------------------------------
+
+def _limit_models(env, monkeypatch, n):
+    """Set max_number_models_loaded_in_memory (= number of NPU domains for LLMs) to n."""
+    real_get = env.worker_mod.rkllama.config.get
+
+    def get(section, key, *args, **kwargs):
+        if (section, key) == ("model", "max_number_models_loaded_in_memory"):
+            return str(n)
+        return real_get(section, key, *args, **kwargs)
+
+    monkeypatch.setattr(env.worker_mod.rkllama.config, "get", get)
+
+
+class _ListQueue:
+    """Stands in for a worker task queue: records what the manager sends."""
+
+    def __init__(self):
+        self.items = []
+
+    def put(self, item):
+        self.items.append(item)
+
+    def close(self):
+        pass
+
+
+def _loaded(env, name, domain, minutes_ago):
+    """Register an already loaded worker that the real stop_worker can unload."""
+    env.manager.workers[name] = types.SimpleNamespace(
+        process=None, task_queue=_ListQueue(), abort_flag=types.SimpleNamespace(value=False),
+        worker_model_info=types.SimpleNamespace(
+            model=name, size=0, base_domain_id=[domain],
+            last_call=datetime.now() - timedelta(minutes=minutes_ago),
+            expires_at=datetime.now() + timedelta(minutes=30)))
+
+
+def test_domain_allocator_offers_every_domain_up_to_the_limit(env, monkeypatch):
+    _limit_models(env, monkeypatch, 3)
+    assert env.manager.get_available_base_domain_id(reverse_order=True) == [3, 2, 1]
+    assert env.manager.get_available_base_domain_id(reverse_order=False) == [1, 2, 3]
+    _loaded(env, "a", 2, 1)
+    assert env.manager.get_available_base_domain_id(reverse_order=False) == [1, 3]

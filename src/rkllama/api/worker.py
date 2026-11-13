@@ -905,17 +905,16 @@ class WorkerManager:
             os.remove(prompt_file)
 
 
-    def get_available_base_domain_id(self, reverse_order=False) -> int | None:
+    def get_available_base_domain_id(self, reverse_order=False) -> list:
         """
-        Returns the smallest available integer between 1 and 10
-        that is not already used as 'base_domain_id' in the current list of worker process.
-        If all numbers from 1 to 10 are taken, returns None.
+        Returns the NPU domain ids in 1..max_number_models_loaded_in_memory that no
+        loaded worker uses (domain 0 is RKNN's), lowest first or highest first.
 
         Args:
             reverse_order (bool): If true, search from the highest to the lowest.
-        
+
         Returns:
-            int | None: The available base_domain_id or None if all are taken.
+            list: The free domain ids; empty if all are taken.
         """
         # Get all used base domain ids
         used_base_domain_ids = [domain for model in self.workers.keys() for domain in self.workers[model].worker_model_info.base_domain_id]
@@ -927,8 +926,8 @@ class WorkerManager:
             # CHeck fir available from the highest to the lowest
             candidates_range = range(max_domain_id, 0, -1)
         else:
-            # CHeck first available from the lowest to the highest  
-            candidates_range = range(1, max_domain_id)
+            # CHeck first available from the lowest to the highest
+            candidates_range = range(1, max_domain_id + 1)
         
         # CHeck check availables
         available_domains = []
