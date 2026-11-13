@@ -1,3 +1,4 @@
+import functools
 import json
 import time
 import datetime
@@ -27,6 +28,24 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("rkllama.server_utils")
+
+
+def _keeps_model_busy(handle_request):
+    """Keep the model marked busy for the whole request, prompt preparation
+    (tokenization) included, so a concurrent load of another model cannot unload
+    it to free an NPU domain before its task reaches the worker. The worker pipe
+    holds its own busy mark until it is closed, which covers streamed responses
+    that outlive this call."""
+    @functools.wraps(handle_request)
+    def wrapper(cls, model_name, *args, **kwargs):
+        manager = variables.worker_manager_rkllm
+        if not manager.begin_request(model_name):
+            return jsonify({"error": f"Model '{model_name}' was unloaded to make room for another model before this request started. Try again."}), 503
+        try:
+            return handle_request(cls, model_name, *args, **kwargs)
+        finally:
+            manager.end_request(model_name)
+    return wrapper
 
 
 class RequestWrapper:
@@ -237,6 +256,7 @@ class ChatEndpointHandler(EndpointHandler):
         return response
         
     @classmethod
+    @_keeps_model_busy
     def handle_request(cls, model_name, messages, system="", stream=True, format_spec=None, options=None, tools=None, enable_thinking=False, is_openai_request=False, images=None):
         """Process a chat request with proper format handling"""
         
@@ -618,6 +638,7 @@ class GenerateEndpointHandler(EndpointHandler):
         return response
     
     @classmethod
+    @_keeps_model_busy
     def handle_request(cls, model_name, prompt, system="", stream=True, format_spec=None, options=None,enable_thinking=False, is_openai_request=False, images=None):
         """Process a generate request with proper format handling"""
         messages = [{"role": "user", "content": prompt}]
@@ -959,6 +980,7 @@ class EmbedEndpointHandler(EndpointHandler):
         return response
     
     @classmethod
+    @_keeps_model_busy
     def handle_request(cls, model_name, input_text, truncate=True, keep_alive=None, options=None, is_openai_request=False):
         """Process a generate request with proper format handling"""
 
