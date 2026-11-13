@@ -433,3 +433,77 @@ def test_failure_before_send_releases_model(env, monkeypatch):
         env.manager._send_tracked_task("m", lambda prepared: ("TASK", prepared), before_send=encoder_fails)
     assert not env.manager.is_busy("m")
     assert env.manager.workers["m"].task_queue.items == [], "a task was sent although its preparation failed"
+
+
+# --- acquire: load if needed and mark busy in one step ------------------------------------
+
+def _recording_loader(env, calls, error=None):
+    """A model loader like the server's load_model: loads through add_worker."""
+    def loader(model_name, options):
+        calls.append((model_name, options))
+        if error:
+            return error
+        env.manager.add_worker(model_name, f"{model_name}.rkllm", "dir", options=options)
+        return None
+    return loader
+
+
+def test_acquire_marks_a_loaded_model_busy_without_loading_it(env, monkeypatch):
+    calls = []
+    env.manager.set_model_loader(_recording_loader(env, calls))
+    _loaded(env, "m", 1, 5)
+
+    assert env.manager.acquire("m") is None
+    assert env.manager.is_busy("m")
+    assert calls == [], "an already loaded model was loaded again"
+
+
+def test_acquire_loads_a_model_that_is_not_loaded_and_marks_it_busy(env, monkeypatch):
+    """E.g. the model was unloaded for another one after the route loaded it:
+    the request loads it again instead of failing with 503."""
+    created = []
+    _use_fake_workers(env, monkeypatch, created)
+    calls = []
+    env.manager.set_model_loader(_recording_loader(env, calls))
+
+    assert env.manager.acquire("m", {"num_ctx": "4096"}) is None
+    assert calls == [("m", {"num_ctx": "4096"})], "the request options did not reach the loader"
+    assert "m" in env.manager.workers and env.manager.is_busy("m")
+
+
+def test_acquire_reports_a_failed_load_and_leaves_nothing_busy(env, monkeypatch):
+    env.manager.set_model_loader(_recording_loader(env, [], error="Modelfile not found"))
+
+    assert env.manager.acquire("m") == "Modelfile not found"
+    assert env.manager._busy == {}
+
+
+def test_acquired_model_cannot_be_unloaded_before_its_request_starts(env, monkeypatch):
+    """Load and busy mark happen in one hold of the lock: another model's load
+    that comes in right after the load (limit 1) must not unload the fresh model
+    before the request marks it busy (log 2026-11-13: HTTP 503)."""
+    _limit_models(env, monkeypatch, 1)
+    created = []
+    _use_fake_workers(env, monkeypatch, created)
+    monkeypatch.setattr(env.manager, "_domain_wait_timeout", lambda: 0.5)
+    loaded = threading.Event()
+
+    def loader(model_name, options):
+        env.manager.add_worker(model_name, f"{model_name}.rkllm", "dir")
+        loaded.set()
+        time.sleep(0.2)  # the window in which a competing load would run
+        return None
+
+    env.manager.set_model_loader(loader)
+    outcome = {}
+    acquirer = threading.Thread(target=lambda: outcome.setdefault("a", env.manager.acquire("a")), daemon=True)
+    acquirer.start()
+    assert loaded.wait(5)
+    competitor, competitor_outcome = _start_load(env, "b")
+
+    acquirer.join(5)
+    competitor.join(5)
+    assert outcome == {"a": None}, outcome
+    assert env.manager.is_busy("a"), "the acquired model is not busy"
+    assert set(env.manager.workers) == {"a"}, "the fresh model was unloaded before its request started"
+    assert isinstance(competitor_outcome.get("error"), env.worker_mod.ModelSlotsBusy), competitor_outcome

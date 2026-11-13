@@ -20,7 +20,7 @@ from rkllama.api.model_utils import (
     get_huggingface_model_info,
     get_property_modelfile, get_model_full_options, find_rkllm_model_name, is_rkllm_model, is_gguf_model, get_gguf_model_path
 )
-from rkllama.api.worker import WorkerManager
+from rkllama.api.worker import WorkerManager, ModelSlotsBusy
 
 # Import the config module
 import rkllama.config
@@ -167,6 +167,9 @@ def load_model(model_name, huggingface_path=None, system="", From=None, request_
         return None, f"Unexpected Error loading the model {model_name} into memory. Check the file .rkllm is not corrupted, properties in Modelfile (like Context Length allowed by the model) and resources available in the server"
     else:
         return None, None
+
+# WorkerManager.acquire (busy marking per request) loads a model that is not loaded through this
+variables.worker_manager_rkllm.set_model_loader(lambda model_name, options: load_model(model_name, request_options=options)[1])
 
 def unload_model(model_name):
     # Relese the model from memory
@@ -1072,12 +1075,9 @@ def generate_ollama():
         # Get all model options
         options = get_model_full_options(model_name, rkllama.config.get_path("models"), options) 
 
-        # Load model if needed
-        if not variables.worker_manager_rkllm.exists_model_loaded(model_name):    
-            _, error = load_model(model_name, request_options=options)
-            if error:
-                return jsonify({"error": f"Failed to load model '{model_name}': {error}"}), 500
-        
+        # The handler loads the model if needed: WorkerManager.acquire loads it and marks it busy in
+        # one step, so a waiting load of another model cannot unload it before this request starts
+
         # DIRECTLY use the GenerateEndpointHandler instead of the process_ollama_generate_request wrapper
         from rkllama.api.server_utils import GenerateEndpointHandler
         return GenerateEndpointHandler.handle_request(
@@ -1178,19 +1178,9 @@ def chat_ollama():
             if DEBUG_MODE:
                 logger.debug(f"Using system message: {system}")
         
-        # Load model if needed
-        if not variables.worker_manager_rkllm.exists_model_loaded(model_name):    
-            
-            if DEBUG_MODE:
-                logger.debug(f"Loading model: {model_name}")
-            _, error = load_model(model_name, request_options=options)
-            if error:
-                if DEBUG_MODE:
-                    logger.error(f"Failed to load model {model_name}: {error}")
-                return jsonify({"error": f"Failed to load model '{model_name}': {error}"}), 500
-            if DEBUG_MODE:
-                logger.debug(f"Model {model_name} loaded successfully")
-                
+        # The handler loads the model if needed: WorkerManager.acquire loads it and marks it busy in
+        # one step, so a waiting load of another model cannot unload it before this request starts
+
         # Process the request
         from rkllama.api.server_utils import ChatEndpointHandler
         return ChatEndpointHandler.handle_request(
@@ -1272,12 +1262,9 @@ def embeddings_ollama():
         # Get all model options
         options = get_model_full_options(model_name, rkllama.config.get_path("models"), options) 
 
-        # Load model if needed
-        if not variables.worker_manager_rkllm.exists_model_loaded(model_name):    
-            _, error = load_model(model_name, request_options=options)
-            if error:
-                return jsonify({"error": f"Failed to load model '{model_name}': {error}"}), 500
-        
+        # The handler loads the model if needed: WorkerManager.acquire loads it and marks it busy in
+        # one step, so a waiting load of another model cannot unload it before this request starts
+
         # DIRECTLY use the EmbedEndpointHandler instead of the process_ollama_generate_request wrapper
         from rkllama.api.server_utils import EmbedEndpointHandler
         return EmbedEndpointHandler.handle_request(
@@ -1572,20 +1559,18 @@ def forward_request_to_llama_cpp_worker(is_openai_request,request):
         else:       
             final_request_path =  "/v1/chat/completions"
 
-    # Load model if needed
-    if not variables.worker_manager_rkllm.exists_model_loaded(model_name):    
-        _, error = load_model(model_name)
-        if error:
-            return jsonify({"error": f"Failed to load model '{model_name}': {error}"}), 500
-            
     # Set the real gguf model name for llama.cpp
     gguf_full_path = Path(get_gguf_model_path(model_name))
     data['model'] =  gguf_full_path.name
 
-    # Keep the model busy until the proxied response is done, so a load of another
-    # model cannot unload it to free its NPU domains mid-answer
-    if not variables.worker_manager_rkllm.begin_request(model_name):
-        return jsonify({"error": f"Model '{model_name}' was unloaded to make room for another model before this request started. Try again."}), 503
+    # Load the model if needed and keep it busy until the proxied response is done, in one
+    # step, so a load of another model cannot unload it before or during the answer
+    try:
+        error = variables.worker_manager_rkllm.acquire(model_name)
+    except ModelSlotsBusy as e:
+        return jsonify({"error": str(e)}), 503
+    if error:
+        return jsonify({"error": f"Failed to load model '{model_name}': {error}"}), 500
     released_by_stream = False
 
     # Make the request for llama.cpp

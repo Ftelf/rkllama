@@ -707,6 +707,11 @@ class TrackedConnection:
             pass
 
 
+class ModelSlotsBusy(RuntimeError):
+    """No model slot (NPU domain) freed up in time: every loaded model kept
+    running requests. Temporary; the client can retry later."""
+
+
 # Class to manage the workers for RKLLM models
 class WorkerManager:
     def __init__(self):
@@ -724,6 +729,10 @@ class WorkerManager:
         # Running requests per model (model name -> count). A model with a running
         # request is never unloaded to free an NPU domain for another model.
         self._busy = {}
+
+        # How acquire() loads a model that is not loaded: loader(model_name, options)
+        # returns None or an error message. The server registers load_model.
+        self._model_loader = None
 
         # Reap any orphaned workers left behind by a previous rkllama run
         # (e.g. SIGKILL, power loss). Without this, restarting the server
@@ -1014,6 +1023,35 @@ class WorkerManager:
             self._busy[model_name] = self._busy.get(model_name, 0) + 1
             return True
 
+    def set_model_loader(self, loader) -> None:
+        """Register how acquire() loads a model: loader(model_name, options)
+        returns None on success or an error message."""
+        self._model_loader = loader
+
+    def acquire(self, model_name, options=None):
+        """Mark a model busy for one request, loading it first if it is not loaded.
+
+        Loading and marking busy happen in one hold of the load lock, so a
+        concurrent load of another model cannot unload the model in between
+        (which a separate load and begin_request allow). A model unloaded for
+        another one after the route loaded it is simply loaded again.
+
+        Returns None (the caller must end_request) or an error message (the
+        model is not marked busy). Raises ModelSlotsBusy if no model slot
+        frees up within max_seconds_waiting_worker_response.
+        """
+        with self._load_lock:
+            if model_name not in self.workers:
+                if self._model_loader is None:
+                    return f"Model '{model_name}' is not loaded."
+                error = self._model_loader(model_name, options)
+                if error:
+                    return error
+                if model_name not in self.workers:
+                    return f"Model '{model_name}' could not be loaded."
+            self._busy[model_name] = self._busy.get(model_name, 0) + 1
+            return None
+
     def end_request(self, model_name) -> None:
         """Undo one begin_request and wake loads waiting for an idle model."""
         with self._load_lock:
@@ -1068,7 +1106,7 @@ class WorkerManager:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 limit = rkllama.config.get("model", "max_number_models_loaded_in_memory")
-                raise RuntimeError(
+                raise ModelSlotsBusy(
                     f"Cannot load model '{model_name}': all {limit} model slots (max_number_models_loaded_in_memory) "
                     f"are taken by models with running requests, waited {self._domain_wait_timeout()} seconds. Try again later."
                 )
