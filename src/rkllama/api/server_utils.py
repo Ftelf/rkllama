@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 from flask import jsonify, Response, stream_with_context
 from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, handle_ollama_response, handle_ollama_embedding_response, get_base64_image_from_pil, get_url_image_from_pil
 from .model_utils import get_property_modelfile
+from .worker import ModelSlotsBusy
 import rkllama.config
 
 # Check for debug mode using the improved method from config
@@ -35,12 +36,17 @@ def _keeps_model_busy(handle_request):
     (tokenization) included, so a concurrent load of another model cannot unload
     it to free an NPU domain before its task reaches the worker. The worker pipe
     holds its own busy mark until it is closed, which covers streamed responses
-    that outlive this call."""
+    that outlive this call. A model unloaded for another one since the route
+    loaded it is loaded again (WorkerManager.acquire)."""
     @functools.wraps(handle_request)
     def wrapper(cls, model_name, *args, **kwargs):
         manager = variables.worker_manager_rkllm
-        if not manager.begin_request(model_name):
-            return jsonify({"error": f"Model '{model_name}' was unloaded to make room for another model before this request started. Try again."}), 503
+        try:
+            error = manager.acquire(model_name, kwargs.get("options"))
+        except ModelSlotsBusy as e:
+            return jsonify({"error": str(e)}), 503
+        if error:
+            return jsonify({"error": f"Failed to load model '{model_name}': {error}"}), 500
         try:
             return handle_request(cls, model_name, *args, **kwargs)
         finally:
