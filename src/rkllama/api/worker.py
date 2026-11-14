@@ -75,7 +75,7 @@ def _kill_orphaned_workers():
         logger.info("Reaped %d orphaned worker(s) from previous run", killed)
 
 from datetime import datetime, timedelta
-from.model_utils import get_model_size, get_encoder_model_path, get_property_modelfile, is_rkllm_model, is_gguf_model, get_rknn_onnx_files_from_model
+from.model_utils import context_length, get_model_size, get_encoder_model_path, get_property_modelfile, is_rkllm_model, is_gguf_model, get_rknn_onnx_files_from_model
 from .classes import *
 from .callback import *
     
@@ -1013,6 +1013,12 @@ class WorkerManager:
         return available_domains
 
 
+    def loaded_num_ctx(self, model_name):
+        """Context length the loaded RKLLM model was initialized with, or None
+        (not loaded, or not an RKLLM model)."""
+        worker = self.workers.get(model_name)
+        return worker.worker_model_info.num_ctx if worker else None
+
     def exists_model_loaded(self, model_name: str) -> bool:
         """
         Check if a model with the given model_name exists in the dict of workers
@@ -1782,6 +1788,8 @@ class WorkerModelInfo:
         self.last_call = datetime.now()
         self.loaded_by = loaded_by or "unknown"
         self.llama_cpp_port = (19990 + base_domain_id) if is_gguf_model(model_name) else None 
+        # Context length (num_ctx) an RKLLM model was loaded with; later requests cannot change it
+        self.num_ctx = None
                         
       
 # Class to manage the information for running RKLLM models
@@ -1837,6 +1845,7 @@ class Worker:
                 
             # RKLLM and RKNN normal workflow
             if is_rkllm_model(self.worker_model_info.model): 
+                self.worker_model_info.num_ctx = context_length(options)
                 # RKLLM
                 self.process = Process(target=run_rkllm_worker, args=(self.worker_model_info.model, self.task_queue, result_queue, self.abort_flag, model_path, model_dir, options, lora_model_path, prompt_cache_path, base_domain_ids[0]))
             
