@@ -116,3 +116,21 @@ def test_worker_records_the_context_it_loads_the_model_with(monkeypatch):
     manager.workers = {"fake-model": worker}
     assert manager.loaded_num_ctx("fake-model") == 12288
     assert manager.loaded_num_ctx("not-loaded") is None
+
+
+# --- /api/show reports the context the model loads with ------------------------------
+
+@pytest.mark.parametrize("modelfile, expected", [
+    ('FROM="m.rkllm"\nNUM_CTX=16384\n', 16384),
+    ('FROM="m.rkllm"\nNUM_CTX=8192\nTEMPERATURE=0.7\n', 8192),
+    ('FROM="m.rkllm"\nTEMPERATURE=0.7\n', None),   # no NUM_CTX: the configured default
+])
+def test_model_context_length_reads_the_modelfile(tmp_path, modelfile, expected):
+    model_utils = _model_utils()
+    import rkllama.config
+    (tmp_path / "Qwen3.5-2B-test").mkdir()
+    (tmp_path / "Qwen3.5-2B-test" / "Modelfile").write_text(modelfile)
+
+    reported = model_utils.model_context_length("Qwen3.5-2B-test", str(tmp_path))
+
+    assert reported == (expected if expected is not None else int(rkllama.config.get("model", "default_num_ctx")))

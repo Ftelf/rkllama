@@ -18,7 +18,7 @@ from rkllama.api.format_utils import strtobool, openai_to_ollama_chat_request, o
 from rkllama.api.model_utils import (
     extract_model_details, 
     get_huggingface_model_info,
-    get_property_modelfile, get_model_full_options, find_rkllm_model_name, is_rkllm_model, is_gguf_model, get_gguf_model_path
+    get_property_modelfile, get_model_full_options, model_context_length, find_rkllm_model_name, is_rkllm_model, is_gguf_model, get_gguf_model_path
 )
 from rkllama.api.worker import WorkerManager, ModelSlotsBusy
 
@@ -421,6 +421,7 @@ def get_current_models():
                         "quantization_level": models_info[model]["details"]["quantization_level"] if model in models_info.keys() else None
                     },
                     "expires_at": worker_model_info.expires_at.strftime('%Y-%m-%d %H:%M:%S.%f'),
+                    "context_length": worker_model_info.num_ctx,
                     "loaded_at": worker_model_info.loaded_at.strftime('%Y-%m-%d %H:%M:%S.%f'),
                     "base_domain_id": worker_model_info.base_domain_id,
                     "last_call": worker_model_info.last_call.strftime('%Y-%m-%d %H:%M:%S.%f'),
@@ -884,6 +885,10 @@ def show_model_info():
             "mistral.feed_forward_length": 14336
         })
     
+    # The context length the model loads with (Modelfile NUM_CTX, else the configured default)
+    # instead of a per-family constant: clients size the chat history they send by it
+    model_info[f"{family}.context_length"] = model_context_length(model_name, rkllama.config.get_path("models"))
+
     # Calculate modified timestamp
     modified_at = datetime.datetime.fromtimestamp(
         os.path.getmtime(file_path)
