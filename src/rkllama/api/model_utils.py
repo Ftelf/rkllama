@@ -402,6 +402,13 @@ def get_property_modelfile(model_name: str, property: str, models_path: str = "m
     # Retrieve the value of the property
     return modelfile_dict.get(property, None)
 
+def context_length(options) -> int:
+    """The context length (num_ctx) an RKLLM model is loaded with for these options:
+    the options' num_ctx, else the configured default. Same value RKLLM passes to
+    rkllm_init as max_context_len."""
+    return int(float((options or {}).get("num_ctx", rkllama.config.get("model", "default_num_ctx"))))
+
+
 def get_model_full_options(model_name: str, models_path: str = "models", request_options: dict = None) -> dict:
     """
     Get model options from Modelfile or return default options if not found.

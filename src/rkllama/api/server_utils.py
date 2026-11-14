@@ -12,7 +12,7 @@ from .worker import worker_error_message, WORKER_TASK_ERROR
 from transformers import AutoTokenizer
 from flask import jsonify, Response, stream_with_context
 from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, handle_ollama_response, handle_ollama_embedding_response, get_base64_image_from_pil, get_url_image_from_pil
-from .model_utils import get_property_modelfile
+from .model_utils import get_property_modelfile, context_length
 from .worker import ModelSlotsBusy
 import rkllama.config
 
@@ -66,13 +66,24 @@ class EndpointHandler:
     """Base class for endpoint handlers with common functionality"""
 
     @staticmethod
-    def prompt_context_error(prompt_tokens, options):
+    def prompt_context_error(prompt_tokens, options, loaded_num_ctx=None):
         """Return an error message if the tokenized prompt does not fit the context length
-        the model is loaded with (num_ctx), else None. Same check as RKLLM.run, done earlier."""
+        the model is loaded with, else None. Same check as RKLLM.run, done earlier.
+
+        The context length is fixed when the model loads (rkllm_init), so a loaded model's
+        value (loaded_num_ctx) wins over the request's num_ctx: a request asking for a
+        different num_ctx neither shrinks nor grows the context of a model already loaded.
+        The request's num_ctx is used only when the model's value is unknown."""
         try:
-            max_context = int(float((options or {}).get("num_ctx", rkllama.config.get("model", "default_num_ctx"))))
+            requested = context_length(options)
         except (TypeError, ValueError):
+            requested = None
+        max_context = loaded_num_ctx if loaded_num_ctx is not None else requested
+        if max_context is None:
             return None
+        if requested is not None and requested != max_context:
+            logger.warning(f"Request asks for num_ctx={requested}, but the model is loaded with {max_context}; "
+                           f"using {max_context} (unload the model to load it with another context length)")
         if len(prompt_tokens) <= max_context:
             return None
         return (
@@ -318,7 +329,8 @@ class ChatEndpointHandler(EndpointHandler):
                 # Reject an over-long prompt before the response starts: a client gets an HTTP error it
                 # can show, while an error line inside an already started 200 stream is dropped by some
                 # clients (Open WebUI shows an empty answer)
-                context_error = cls.prompt_context_error(final_prompt, options)
+                context_error = cls.prompt_context_error(final_prompt, options,
+                                                         variables.worker_manager_rkllm.loaded_num_ctx(model_name))
                 if context_error:
                     logger.error(f"Rejected request for model {model_name}: {context_error}")
                     return jsonify({"error": context_error}), 400
@@ -726,7 +738,8 @@ class GenerateEndpointHandler(EndpointHandler):
                 # Reject an over-long prompt before the response starts: a client gets an HTTP error it
                 # can show, while an error line inside an already started 200 stream is dropped by some
                 # clients (Open WebUI shows an empty answer)
-                context_error = cls.prompt_context_error(final_prompt, options)
+                context_error = cls.prompt_context_error(final_prompt, options,
+                                                         variables.worker_manager_rkllm.loaded_num_ctx(model_name))
                 if context_error:
                     logger.error(f"Rejected request for model {model_name}: {context_error}")
                     return jsonify({"error": context_error}), 400
