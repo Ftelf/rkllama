@@ -472,6 +472,12 @@ def get_model_full_options(model_name: str, models_path: str = "models", request
     return default_options
             
     
+def model_context_length(model_name: str, models_path: str = "models") -> int:
+    """Context length a model loads with when the request sets no num_ctx:
+    the Modelfile's NUM_CTX, else the configured default."""
+    return context_length(get_model_full_options(model_name, models_path))
+
+
 def get_model_size(model_name) -> int:
     """
     Get the size of a model
