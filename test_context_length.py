@@ -57,11 +57,11 @@ def test_context_length_uses_num_ctx_else_the_configured_default():
     import rkllama.config
     default = int(rkllama.config.get("model", "default_num_ctx"))
 
-    assert model_utils.context_length(None) == default
-    assert model_utils.context_length({}) == default
-    assert model_utils.context_length({"num_ctx": "8192"}) == 8192    # Modelfile values are strings
-    assert model_utils.context_length({"num_ctx": "16384.0"}) == 16384
-    assert model_utils.context_length({"num_ctx": 12288}) == 12288
+    assert model_utils.context_length_from_options(None) == default
+    assert model_utils.context_length_from_options({}) == default
+    assert model_utils.context_length_from_options({"num_ctx": "8192"}) == 8192    # Modelfile values are strings
+    assert model_utils.context_length_from_options({"num_ctx": "16384.0"}) == 16384
+    assert model_utils.context_length_from_options({"num_ctx": 12288}) == 12288
 
 
 @pytest.mark.parametrize("loaded, requested, n_tokens, rejected", [
@@ -114,8 +114,8 @@ def test_worker_records_the_context_it_loads_the_model_with(monkeypatch):
 
     manager = worker_mod.WorkerManager.__new__(worker_mod.WorkerManager)  # no orphan reaping / signal handlers
     manager.workers = {"fake-model": worker}
-    assert manager.loaded_num_ctx("fake-model") == 12288
-    assert manager.loaded_num_ctx("not-loaded") is None
+    assert manager.loaded_context_length("fake-model") == 12288
+    assert manager.loaded_context_length("not-loaded") is None
 
 
 # --- /api/show reports the context the model loads with ------------------------------
@@ -131,6 +131,6 @@ def test_model_context_length_reads_the_modelfile(tmp_path, modelfile, expected)
     (tmp_path / "Qwen3.5-2B-test").mkdir()
     (tmp_path / "Qwen3.5-2B-test" / "Modelfile").write_text(modelfile)
 
-    reported = model_utils.model_context_length("Qwen3.5-2B-test", str(tmp_path))
+    reported = model_utils.modelfile_context_length("Qwen3.5-2B-test", str(tmp_path))
 
     assert reported == (expected if expected is not None else int(rkllama.config.get("model", "default_num_ctx")))

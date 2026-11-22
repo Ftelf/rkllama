@@ -12,7 +12,7 @@ from .worker import worker_error_message, WORKER_TASK_ERROR
 from transformers import AutoTokenizer
 from flask import jsonify, Response, stream_with_context
 from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, handle_ollama_response, handle_ollama_embedding_response, get_base64_image_from_pil, get_url_image_from_pil
-from .model_utils import get_property_modelfile, context_length
+from .model_utils import get_property_modelfile, context_length_from_options, prompt_too_long_message
 from .worker import ModelSlotsBusy
 import rkllama.config
 
@@ -32,22 +32,33 @@ logging.basicConfig(
 logger = logging.getLogger("rkllama.server_utils")
 
 
-def _keeps_model_busy(handle_request):
-    """Keep the model marked busy for the whole request, prompt preparation
-    (tokenization) included, so a concurrent load of another model cannot unload
-    it to free an NPU domain before its task reaches the worker. The worker pipe
-    holds its own busy mark until it is closed, which covers streamed responses
-    that outlive this call. A model unloaded for another one since the route
-    loaded it is loaded again (WorkerManager.acquire)."""
+def load_and_begin_request_or_error(model_name, options=None):
+    """WorkerManager.load_and_begin_request as an HTTP outcome: None when the model is
+    loaded and marked busy (the caller must end_request), else the error response:
+    503 if no model slot freed up in time, 500 if the load failed."""
+    try:
+        error = variables.worker_manager_rkllm.load_and_begin_request(model_name, options)
+    except ModelSlotsBusy as e:
+        return jsonify({"error": str(e)}), 503
+    if error:
+        return jsonify({"error": f"Failed to load model '{model_name}': {error}"}), 500
+    return None
+
+
+def _with_loaded_model(handle_request):
+    """Load the model if needed and keep it marked busy for the whole request,
+    prompt preparation (tokenization) included, so a concurrent load of another
+    model cannot unload it to free an NPU domain before its task reaches the
+    worker. A model that is not loaded, or was unloaded for another one, is loaded
+    here (WorkerManager.load_and_begin_request); failures become HTTP 503 / 500.
+    The worker pipe holds its own busy mark until it is closed, which covers
+    streamed responses that outlive this call."""
     @functools.wraps(handle_request)
     def wrapper(cls, model_name, *args, **kwargs):
         manager = variables.worker_manager_rkllm
-        try:
-            error = manager.acquire(model_name, kwargs.get("options"))
-        except ModelSlotsBusy as e:
-            return jsonify({"error": str(e)}), 503
-        if error:
-            return jsonify({"error": f"Failed to load model '{model_name}': {error}"}), 500
+        error_response = load_and_begin_request_or_error(model_name, kwargs.get("options"))
+        if error_response:
+            return error_response
         try:
             return handle_request(cls, model_name, *args, **kwargs)
         finally:
@@ -66,19 +77,19 @@ class EndpointHandler:
     """Base class for endpoint handlers with common functionality"""
 
     @staticmethod
-    def prompt_context_error(prompt_tokens, options, loaded_num_ctx=None):
+    def prompt_context_error(prompt_tokens, options, loaded_context_length=None):
         """Return an error message if the tokenized prompt does not fit the context length
         the model is loaded with, else None. Same check as RKLLM.run, done earlier.
 
         The context length is fixed when the model loads (rkllm_init), so a loaded model's
-        value (loaded_num_ctx) wins over the request's num_ctx: a request asking for a
+        value (loaded_context_length) wins over the request's num_ctx: a request asking for a
         different num_ctx neither shrinks nor grows the context of a model already loaded.
         The request's num_ctx is used only when the model's value is unknown."""
         try:
-            requested = context_length(options)
+            requested = context_length_from_options(options)
         except (TypeError, ValueError):
             requested = None
-        max_context = loaded_num_ctx if loaded_num_ctx is not None else requested
+        max_context = loaded_context_length if loaded_context_length is not None else requested
         if max_context is None:
             return None
         if requested is not None and requested != max_context:
@@ -86,10 +97,7 @@ class EndpointHandler:
                            f"using {max_context} (unload the model to load it with another context length)")
         if len(prompt_tokens) <= max_context:
             return None
-        return (
-            f"The prompt has {len(prompt_tokens)} tokens, more than the model's context length of {max_context} tokens. "
-            "Shorten the prompt (chat history, system prompt, tool definitions) or use a model converted with a larger context."
-        )
+        return prompt_too_long_message(len(prompt_tokens), max_context)
 
     @staticmethod
     def receive_worker_message(parent_pipe):
@@ -299,7 +307,7 @@ class ChatEndpointHandler(EndpointHandler):
         return response
         
     @classmethod
-    @_keeps_model_busy
+    @_with_loaded_model
     def handle_request(cls, model_name, messages, system="", stream=True, format_spec=None, options=None, tools=None, enable_thinking=False, is_openai_request=False, images=None):
         """Process a chat request with proper format handling"""
         
@@ -330,7 +338,7 @@ class ChatEndpointHandler(EndpointHandler):
                 # can show, while an error line inside an already started 200 stream is dropped by some
                 # clients (Open WebUI shows an empty answer)
                 context_error = cls.prompt_context_error(final_prompt, options,
-                                                         variables.worker_manager_rkllm.loaded_num_ctx(model_name))
+                                                         variables.worker_manager_rkllm.loaded_context_length(model_name))
                 if context_error:
                     logger.error(f"Rejected request for model {model_name}: {context_error}")
                     return jsonify({"error": context_error}), 400
@@ -705,7 +713,7 @@ class GenerateEndpointHandler(EndpointHandler):
         return response
     
     @classmethod
-    @_keeps_model_busy
+    @_with_loaded_model
     def handle_request(cls, model_name, prompt, system="", stream=True, format_spec=None, options=None,enable_thinking=False, is_openai_request=False, images=None):
         """Process a generate request with proper format handling"""
         messages = [{"role": "user", "content": prompt}]
@@ -739,7 +747,7 @@ class GenerateEndpointHandler(EndpointHandler):
                 # can show, while an error line inside an already started 200 stream is dropped by some
                 # clients (Open WebUI shows an empty answer)
                 context_error = cls.prompt_context_error(final_prompt, options,
-                                                         variables.worker_manager_rkllm.loaded_num_ctx(model_name))
+                                                         variables.worker_manager_rkllm.loaded_context_length(model_name))
                 if context_error:
                     logger.error(f"Rejected request for model {model_name}: {context_error}")
                     return jsonify({"error": context_error}), 400
@@ -1071,7 +1079,7 @@ class EmbedEndpointHandler(EndpointHandler):
         return response
     
     @classmethod
-    @_keeps_model_busy
+    @_with_loaded_model
     def handle_request(cls, model_name, input_text, truncate=True, keep_alive=None, options=None, is_openai_request=False):
         """Process a generate request with proper format handling"""
 
