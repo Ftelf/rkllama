@@ -18,9 +18,9 @@ from rkllama.api.format_utils import strtobool, openai_to_ollama_chat_request, o
 from rkllama.api.model_utils import (
     extract_model_details, 
     get_huggingface_model_info,
-    get_property_modelfile, get_model_full_options, model_context_length, find_rkllm_model_name, is_rkllm_model, is_gguf_model, get_gguf_model_path
+    get_property_modelfile, get_model_full_options, modelfile_context_length, find_rkllm_model_name, is_rkllm_model, is_gguf_model, get_gguf_model_path
 )
-from rkllama.api.worker import WorkerManager, ModelSlotsBusy
+from rkllama.api.worker import WorkerManager
 
 # Import the config module
 import rkllama.config
@@ -168,7 +168,7 @@ def load_model(model_name, huggingface_path=None, system="", From=None, request_
     else:
         return None, None
 
-# WorkerManager.acquire (busy marking per request) loads a model that is not loaded through this
+# WorkerManager.load_and_begin_request (busy marking per request) loads a model that is not loaded through this
 variables.worker_manager_rkllm.set_model_loader(lambda model_name, options: load_model(model_name, request_options=options)[1])
 
 def unload_model(model_name):
@@ -887,7 +887,7 @@ def show_model_info():
     
     # The context length the model loads with (Modelfile NUM_CTX, else the configured default)
     # instead of a per-family constant: clients size the chat history they send by it
-    model_info[f"{family}.context_length"] = model_context_length(model_name, rkllama.config.get_path("models"))
+    model_info[f"{family}.context_length"] = modelfile_context_length(model_name, rkllama.config.get_path("models"))
 
     # Calculate modified timestamp
     modified_at = datetime.datetime.fromtimestamp(
@@ -1080,7 +1080,7 @@ def generate_ollama():
         # Get all model options
         options = get_model_full_options(model_name, rkllama.config.get_path("models"), options) 
 
-        # The handler loads the model if needed: WorkerManager.acquire loads it and marks it busy in
+        # The handler loads the model if needed: WorkerManager.load_and_begin_request loads it and marks it busy in
         # one step, so a waiting load of another model cannot unload it before this request starts
 
         # DIRECTLY use the GenerateEndpointHandler instead of the process_ollama_generate_request wrapper
@@ -1183,7 +1183,7 @@ def chat_ollama():
             if DEBUG_MODE:
                 logger.debug(f"Using system message: {system}")
         
-        # The handler loads the model if needed: WorkerManager.acquire loads it and marks it busy in
+        # The handler loads the model if needed: WorkerManager.load_and_begin_request loads it and marks it busy in
         # one step, so a waiting load of another model cannot unload it before this request starts
 
         # Process the request
@@ -1267,7 +1267,7 @@ def embeddings_ollama():
         # Get all model options
         options = get_model_full_options(model_name, rkllama.config.get_path("models"), options) 
 
-        # The handler loads the model if needed: WorkerManager.acquire loads it and marks it busy in
+        # The handler loads the model if needed: WorkerManager.load_and_begin_request loads it and marks it busy in
         # one step, so a waiting load of another model cannot unload it before this request starts
 
         # DIRECTLY use the EmbedEndpointHandler instead of the process_ollama_generate_request wrapper
@@ -1570,12 +1570,10 @@ def forward_request_to_llama_cpp_worker(is_openai_request,request):
 
     # Load the model if needed and keep it busy until the proxied response is done, in one
     # step, so a load of another model cannot unload it before or during the answer
-    try:
-        error = variables.worker_manager_rkllm.acquire(model_name)
-    except ModelSlotsBusy as e:
-        return jsonify({"error": str(e)}), 503
-    if error:
-        return jsonify({"error": f"Failed to load model '{model_name}': {error}"}), 500
+    from rkllama.api.server_utils import load_and_begin_request_or_error
+    error_response = load_and_begin_request_or_error(model_name)
+    if error_response:
+        return error_response
     released_by_stream = False
 
     # Make the request for llama.cpp

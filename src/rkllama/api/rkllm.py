@@ -1,6 +1,6 @@
 import ctypes
 from .classes import *
-from .model_utils import context_length
+from .model_utils import context_length_from_options, prompt_too_long_message
 import logging
 import numpy as np
 
@@ -29,7 +29,7 @@ class RKLLM(object):
         # Configure RKLLM parameters
         self.rkllm_param = RKLLMParam()
         self.rkllm_param.model_path = bytes(model_path, 'utf-8')
-        self.rkllm_param.max_context_len = context_length(options)
+        self.rkllm_param.max_context_len = context_length_from_options(options)
         self.rkllm_param.max_new_tokens = int(options.get("max_new_tokens", rkllama.config.get("model", "default_max_new_tokens")))
         self.rkllm_param.top_k = float(options.get("top_k", rkllama.config.get("model", "default_top_k")))
         self.rkllm_param.top_p = float(options.get("top_p", rkllama.config.get("model", "default_top_p")))
@@ -212,10 +212,7 @@ class RKLLM(object):
             n_prompt_tokens = len(input[0])
             max_context = int(self.rkllm_param.max_context_len)
             if n_prompt_tokens > max_context:
-                self.last_run_error = (
-                    f"The prompt has {n_prompt_tokens} tokens, more than the model's context length of {max_context} tokens. "
-                    "Shorten the prompt (chat history, system prompt, tool definitions) or use a model converted with a larger context."
-                )
+                self.last_run_error = prompt_too_long_message(n_prompt_tokens, max_context)
                 logger.error(self.last_run_error)
                 return
 

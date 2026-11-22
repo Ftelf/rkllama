@@ -75,7 +75,7 @@ def _kill_orphaned_workers():
         logger.info("Reaped %d orphaned worker(s) from previous run", killed)
 
 from datetime import datetime, timedelta
-from.model_utils import context_length, get_model_size, get_encoder_model_path, get_property_modelfile, is_rkllm_model, is_gguf_model, get_rknn_onnx_files_from_model
+from.model_utils import context_length_from_options, get_model_size, get_encoder_model_path, get_property_modelfile, is_rkllm_model, is_gguf_model, get_rknn_onnx_files_from_model
 from .classes import *
 from .callback import *
     
@@ -759,13 +759,13 @@ class WorkerManager:
         # first in self.workers, leaving an untracked worker holding NPU memory.
         # A Condition (re-entrant lock underneath) so a load waiting for a free NPU
         # domain can sleep until a request finishes or a model is unloaded.
-        self._load_lock = threading.Condition()
+        self._workers_cond = threading.Condition()
 
         # Running requests per model (model name -> count). A model with a running
         # request is never unloaded to free an NPU domain for another model.
         self._busy = {}
 
-        # How acquire() loads a model that is not loaded: loader(model_name, options)
+        # How load_and_begin_request() loads a model that is not loaded: loader(model_name, options)
         # returns None or an error message. The server registers load_model.
         self._model_loader = None
 
@@ -990,13 +990,13 @@ class WorkerManager:
             os.remove(prompt_file)
 
 
-    def get_available_base_domain_id(self, reverse_order=False) -> list:
+    def free_base_domain_ids(self, highest_first=False) -> list:
         """
         Returns the NPU domain ids in 1..max_number_models_loaded_in_memory that no
         loaded worker uses (domain 0 is RKNN's), lowest first or highest first.
 
         Args:
-            reverse_order (bool): If true, search from the highest to the lowest.
+            highest_first (bool): If true, list the ids from the highest to the lowest.
 
         Returns:
             list: The free domain ids; empty if all are taken.
@@ -1007,14 +1007,14 @@ class WorkerManager:
         # Get the max id of a domain base:
         max_domain_id = int(rkllama.config.get("model", "max_number_models_loaded_in_memory"))
 
-        if reverse_order:
-            # CHeck fir available from the highest to the lowest
+        if highest_first:
+            # From the highest to the lowest
             candidates_range = range(max_domain_id, 0, -1)
         else:
-            # CHeck first available from the lowest to the highest
+            # From the lowest to the highest
             candidates_range = range(1, max_domain_id + 1)
         
-        # CHeck check availables
+        # Keep the ones no worker uses
         available_domains = []
         for candidate in candidates_range:
             if candidate not in used_base_domain_ids:
@@ -1022,7 +1022,7 @@ class WorkerManager:
         return available_domains
 
 
-    def loaded_num_ctx(self, model_name):
+    def loaded_context_length(self, model_name):
         """Context length the loaded RKLLM model was initialized with, or None
         (not loaded, or not an RKLLM model)."""
         worker = self.workers.get(model_name)
@@ -1049,7 +1049,7 @@ class WorkerManager:
         Returns:
             bool: True if the model is loaded (by this call or a concurrent one), False if the load failed.
         """
-        with self._load_lock:
+        with self._workers_cond:
             if model_name in self.workers:
                 # A concurrent request loaded it while this one waited for the lock
                 return True
@@ -1058,30 +1058,30 @@ class WorkerManager:
     def begin_request(self, model_name) -> bool:
         """Mark a model busy for one request. Returns False if it is not loaded
         (e.g. unloaded for another model just before this request started)."""
-        with self._load_lock:
+        with self._workers_cond:
             if model_name not in self.workers:
                 return False
             self._busy[model_name] = self._busy.get(model_name, 0) + 1
             return True
 
     def set_model_loader(self, loader) -> None:
-        """Register how acquire() loads a model: loader(model_name, options)
+        """Register how load_and_begin_request() loads a model: loader(model_name, options)
         returns None on success or an error message."""
         self._model_loader = loader
 
-    def acquire(self, model_name, options=None):
+    def load_and_begin_request(self, model_name, options=None):
         """Mark a model busy for one request, loading it first if it is not loaded.
 
-        Loading and marking busy happen in one hold of the load lock, so a
+        Loading and marking busy happen in one hold of self._workers_cond, so a
         concurrent load of another model cannot unload the model in between
-        (which a separate load and begin_request allow). A model unloaded for
-        another one after the route loaded it is simply loaded again.
+        (which a separate load and begin_request allow). A model that is not
+        loaded, or was unloaded for another one, is loaded here.
 
         Returns None (the caller must end_request) or an error message (the
         model is not marked busy). Raises ModelSlotsBusy if no model slot
         frees up within max_seconds_waiting_worker_response.
         """
-        with self._load_lock:
+        with self._workers_cond:
             if model_name not in self.workers:
                 if self._model_loader is None:
                     return f"Model '{model_name}' is not loaded."
@@ -1095,13 +1095,13 @@ class WorkerManager:
 
     def end_request(self, model_name) -> None:
         """Undo one begin_request and wake loads waiting for an idle model."""
-        with self._load_lock:
+        with self._workers_cond:
             count = self._busy.get(model_name, 0) - 1
             if count > 0:
                 self._busy[model_name] = count
             else:
                 self._busy.pop(model_name, None)
-            self._load_lock.notify_all()
+            self._workers_cond.notify_all()
 
     def is_busy(self, model_name) -> bool:
         """True while the model has at least one running request."""
@@ -1121,12 +1121,12 @@ class WorkerManager:
             return None
         return min(candidates, key=attrgetter('last_call')).model
 
-    def _wait_for_free_domains(self, model_name):
+    def _make_room_for(self, model_name):
         """Return the free NPU domains for a new RKLLM/GGUF worker. When all
         max_number_models_loaded_in_memory domains are taken, unload the least
         recently used idle model; if every loaded model is busy, wait until one
         finishes or is unloaded. Returns None if a concurrent request loaded
-        this model meanwhile. Caller must hold self._load_lock."""
+        this model meanwhile. Caller must hold self._workers_cond."""
         deadline = time.monotonic() + self._domain_wait_timeout()
         while True:
             if model_name in self.workers:
@@ -1134,7 +1134,7 @@ class WorkerManager:
                 # unloading it to load it again would only cost the load time
                 return None
 
-            free_domains = self.get_available_base_domain_id(reverse_order=True)
+            free_domains = self.free_base_domain_ids(highest_first=True)
             if free_domains:
                 return free_domains
 
@@ -1152,13 +1152,13 @@ class WorkerManager:
                     f"are taken by models with running requests, waited {self._domain_wait_timeout()} seconds. Try again later."
                 )
             logger.info(f"All NPU domains in use by busy models: model {model_name} waits for one to finish")
-            self._load_lock.wait(timeout=remaining)
+            self._workers_cond.wait(timeout=remaining)
 
     def _create_worker(self, model_name, model_path, model_dir, options, lora_model_path, prompt_cache_path, loaded_by) -> bool:
-        """Create and register the worker for a model. Caller must hold self._load_lock."""
+        """Create and register the worker for a model. Caller must hold self._workers_cond."""
         if is_rkllm_model(model_name) or is_gguf_model(model_name):
             # Get the available domain ids for the RKLLM/GGUF process (unloads or waits if all are taken)
-            base_domain_ids = self._wait_for_free_domains(model_name)
+            base_domain_ids = self._make_room_for(model_name)
             if base_domain_ids is None:
                 return True
         else:
@@ -1361,18 +1361,19 @@ class WorkerManager:
 
     def stop_worker(self, model_name, timeout=30):
         """
-        Stop/Unload a model worker (see _stop_worker_unlocked). Serialized with
+        Stop/Unload a model worker (see _stop_worker_locked). Serialized with
         model loads, and wakes loads waiting for a free NPU domain.
         """
-        with self._load_lock:
+        with self._workers_cond:
             try:
-                self._stop_worker_unlocked(model_name, timeout)
+                self._stop_worker_locked(model_name, timeout)
             finally:
-                self._load_lock.notify_all()
+                self._workers_cond.notify_all()
 
-    def _stop_worker_unlocked(self, model_name, timeout=30):
+    def _stop_worker_locked(self, model_name, timeout=30):
         """
-        Stop/Unload a model worker. Sends an unload command and waits up to
+        Stop/Unload a model worker. Caller must hold self._workers_cond (stop_worker
+        takes it). Sends an unload command and waits up to
         ``timeout`` seconds for the worker process to exit. If the process
         does not exit in time it is forcefully killed so that NPU memory is
         always reclaimed.
@@ -1854,7 +1855,7 @@ class Worker:
                 
             # RKLLM and RKNN normal workflow
             if is_rkllm_model(self.worker_model_info.model): 
-                self.worker_model_info.num_ctx = context_length(options)
+                self.worker_model_info.num_ctx = context_length_from_options(options)
                 # RKLLM
                 self.process = Process(target=run_rkllm_worker, args=(self.worker_model_info.model, self.task_queue, result_queue, self.abort_flag, model_path, model_dir, options, lora_model_path, prompt_cache_path, base_domain_ids[0]))
             

@@ -236,10 +236,10 @@ def _loaded(env, name, domain, minutes_ago):
 
 def test_domain_allocator_offers_every_domain_up_to_the_limit(env, monkeypatch):
     _limit_models(env, monkeypatch, 3)
-    assert env.manager.get_available_base_domain_id(reverse_order=True) == [3, 2, 1]
-    assert env.manager.get_available_base_domain_id(reverse_order=False) == [1, 2, 3]
+    assert env.manager.free_base_domain_ids(highest_first=True) == [3, 2, 1]
+    assert env.manager.free_base_domain_ids(highest_first=False) == [1, 2, 3]
     _loaded(env, "a", 2, 1)
-    assert env.manager.get_available_base_domain_id(reverse_order=False) == [1, 3]
+    assert env.manager.free_base_domain_ids(highest_first=False) == [1, 3]
 
 
 # --- full NPU domains: unload the least recently used idle model, wait while all are busy
@@ -435,7 +435,7 @@ def test_failure_before_send_releases_model(env, monkeypatch):
     assert env.manager.workers["m"].task_queue.items == [], "a task was sent although its preparation failed"
 
 
-# --- acquire: load if needed and mark busy in one step ------------------------------------
+# --- load_and_begin_request: load if needed and mark busy in one step ------------------------------------
 
 def _recording_loader(env, calls, error=None):
     """A model loader like the server's load_model: loads through add_worker."""
@@ -453,7 +453,7 @@ def test_acquire_marks_a_loaded_model_busy_without_loading_it(env, monkeypatch):
     env.manager.set_model_loader(_recording_loader(env, calls))
     _loaded(env, "m", 1, 5)
 
-    assert env.manager.acquire("m") is None
+    assert env.manager.load_and_begin_request("m") is None
     assert env.manager.is_busy("m")
     assert calls == [], "an already loaded model was loaded again"
 
@@ -466,7 +466,7 @@ def test_acquire_loads_a_model_that_is_not_loaded_and_marks_it_busy(env, monkeyp
     calls = []
     env.manager.set_model_loader(_recording_loader(env, calls))
 
-    assert env.manager.acquire("m", {"num_ctx": "4096"}) is None
+    assert env.manager.load_and_begin_request("m", {"num_ctx": "4096"}) is None
     assert calls == [("m", {"num_ctx": "4096"})], "the request options did not reach the loader"
     assert "m" in env.manager.workers and env.manager.is_busy("m")
 
@@ -474,7 +474,7 @@ def test_acquire_loads_a_model_that_is_not_loaded_and_marks_it_busy(env, monkeyp
 def test_acquire_reports_a_failed_load_and_leaves_nothing_busy(env, monkeypatch):
     env.manager.set_model_loader(_recording_loader(env, [], error="Modelfile not found"))
 
-    assert env.manager.acquire("m") == "Modelfile not found"
+    assert env.manager.load_and_begin_request("m") == "Modelfile not found"
     assert env.manager._busy == {}
 
 
@@ -496,7 +496,7 @@ def test_acquired_model_cannot_be_unloaded_before_its_request_starts(env, monkey
 
     env.manager.set_model_loader(loader)
     outcome = {}
-    acquirer = threading.Thread(target=lambda: outcome.setdefault("a", env.manager.acquire("a")), daemon=True)
+    acquirer = threading.Thread(target=lambda: outcome.setdefault("a", env.manager.load_and_begin_request("a")), daemon=True)
     acquirer.start()
     assert loaded.wait(5)
     competitor, competitor_outcome = _start_load(env, "b")
