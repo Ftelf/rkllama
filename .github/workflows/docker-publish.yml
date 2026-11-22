@@ -5,13 +5,12 @@ name: Docker
 # separate terms of service, privacy policy, and support
 # documentation.
 
+# Manual runs only (Ftelf/rkllama#3): no build or GHCR publish on push,
+# tag or pull request until the fork's local build/test/hardware flow is
+# proven. Start a run from the Actions tab or with
+# `gh workflow run docker-publish.yml --ref <branch-or-tag>`.
 on:
-  push:
-    branches: [ "main", "Rkllama-Docker" ]
-    # Publish semver tags as releases.
-    tags: [ 'v*.*.*' ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   # Use docker.io for Docker Hub if empty
