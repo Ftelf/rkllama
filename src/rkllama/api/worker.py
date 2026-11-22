@@ -323,6 +323,9 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                 # Drop the previous run's metrics: the RKLLM_RUN_FINISH callback refills
                 # them, so an empty list afterwards means this run produced no result
                 global_metrics.clear()
+                # global_text is module-level and outlives a request: tokens left by an aborted or failed
+                # run must not be sent as the start of this answer
+                global_text.clear()
                 # Run inference
                 thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input, options))
                 thread_model.start()
@@ -349,6 +352,12 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                     # Only sleep if no tokens were processed and thread is still alive
                     if not tokens_processed and not thread_finished:
                         time.sleep(0.001)
+
+                # The model thread can append its last token between the drain above and join(): drain once
+                # more, or that token is lost for this answer and stays in global_text for the next request
+                if not abort_flag.value:
+                    while len(global_text) > 0:
+                        child_conn.send(global_text.pop(0))
 
                 # Check for abort of inference
                 if abort_flag.value:
