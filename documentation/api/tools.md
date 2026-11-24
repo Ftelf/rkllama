@@ -6,7 +6,7 @@ RKLLama provides comprehensive tool/function calling capabilities with full Olla
 
 Tool calling allows your language models to interact with external functions and APIs in a structured way. RKLLama's implementation supports:
 
-- **Multiple LLM formats** (Qwen, Llama 3.2+, others)
+- **Multiple LLM formats** (Qwen JSON, Qwen3.5 XML, Llama 3.2+, others)
 - **Ollama API compatibility** 
 - **Streaming and non-streaming modes**
 - **Robust JSON extraction and validation**
@@ -134,6 +134,7 @@ RKLLama's tool calling works with multiple model formats:
 | Model Type | Format | Detection Method | Support Level |
 |------------|--------|------------------|---------------|
 | **Qwen 2.5+** | `<tool_call></tool_call>` tags | Standard detection | ✅ Native |
+| **Qwen3.5** | `<tool_call>` with `<function=...>` XML | XML parser | ✅ Native |
 | **Llama 3.2+** | Generic JSON | JSON pattern matching | ✅ Full |
 | **Other LLMs** | Generic JSON | Fallback parsing | ✅ Compatible |
 
@@ -146,6 +147,30 @@ Qwen models use built-in tool calling with `<tool_call>` tags:
 {"name": "get_weather", "arguments": {"location": "Tokyo"}}
 </tool_call>
 ```
+
+### Qwen3.5 Models (XML form)
+
+Qwen3.5 (like Qwen3-Coder) writes the call as XML inside the `<tool_call>` tags:
+
+```
+<tool_call>
+<function=get_weather>
+<parameter=city>
+Paris
+</parameter>
+</function>
+</tool_call>
+```
+
+RKLLama returns this as the same `tool_calls` entry as the JSON form:
+`{"function": {"name": "get_weather", "arguments": {"city": "Paris"}}}`.
+
+- **Grammar**: a block counts only when it holds exactly one `<function=NAME>`, then zero or more `<parameter=NAME>VALUE</parameter>` separated only by whitespace, then `</function>`. A block whose text starts with `<function=` is read by the XML parser only; every other block by the JSON parser.
+- **Values** are text. A string value loses exactly one leading and one trailing line break, `\n` or `\r\n` (the model writes the value on its own line); other whitespace is kept.
+- **Types** come from the tool's JSON schema in the request (`parameters.properties.<name>`): `integer`, `number`, `boolean` (`true`/`false`, any case), `null`, `object` and `array` (JSON text) give the typed value when the text converts. A list of types, or `anyOf` / `oneOf` one level deep, is tried with `null` first, then in the listed order. A value that does not convert, a `string` schema (`"42"` stays `"42"`), a parameter or tool missing from the schema, or a request without `tools` gives a string.
+- **Several blocks** give several `tool_calls` in text order (XML and JSON blocks can be mixed). A repeated parameter keeps the last value; a function without parameters gives `"arguments": {}`.
+- **Content**: in a non-streamed answer, the text around the parsed XML blocks stays in `message.content` (blocks removed, trimmed). The JSON form keeps an empty `content`. Streamed answers send the tool chunk with `content: ""` for both forms.
+- **Malformed blocks** (an unclosed `<tool_call>`, an empty function or parameter name, a missing `</function>` or `</parameter>`, text between the elements, two functions in one block) are not calls. When no other block in the answer gives a call, the answer stays text and `done_reason` is `"stop"`. When another block does give a call, the answer is a tool-call answer and the content rule above applies: the malformed block's text stays in `content` next to a parsed XML call, and is dropped when every call comes from the JSON form. The server log says why a block was not parsed, without the answer text.
 
 ### Llama 3.2+ Models
 
@@ -185,7 +210,13 @@ Models can call multiple tools in a single response:
 
 ### Streaming Tool Calls
 
-Tool calls work seamlessly with streaming responses. The tool call information is sent as the final chunk:
+With streaming, the server looks for a call only in the first 100 tokens of the answer (thinking text not counted) and holds those tokens back while it looks:
+
+- A `<tool_call>` tag within those 100 tokens, or an answer shorter than 100 tokens that holds a call: the call is sent as one chunk with `tool_calls` and `content: ""`, followed by the final chunk with `done_reason: "tool_calls"`.
+- A `<tool_call>` tag but no call that can be parsed from it: the answer is sent as text and ends with `done_reason: "stop"`.
+- A call that starts after the first 100 tokens is **not detected**: it is streamed as plain text, without `tool_calls`, and ends with `done_reason: "stop"`. Use `stream: false` when a model writes text before its calls.
+
+On `/v1/chat/completions` with `stream: true`, each tool call has an `id` (`call_...`), `type: "function"`, an `index`, and `function.arguments` as a JSON string (booleans, `null` and apostrophes included).
 
 ```bash
 curl -X POST http://localhost:8080/api/chat \
@@ -202,8 +233,8 @@ curl -X POST http://localhost:8080/api/chat \
 
 RKLLama uses a multi-stage detection system:
 
-1. **Standard Format Detection**: Looks for `<tool_call>...</tool_call>` tags
-2. **Generic JSON Extraction**: Parses any JSON with `name` + `arguments`/`parameters`
+1. **Standard Format Detection**: Looks for `<tool_call>...</tool_call>` tags; a block starting with `<function=` is parsed as the XML form, any other block as JSON
+2. **Generic JSON Extraction**: When no block gives a call, parses any JSON with `name` + `arguments`/`parameters` in the whole answer (skipped when the answer holds an XML block, so a parameter value that looks like JSON is never taken for a call)
 3. **Format Normalization**: Converts `parameters` to `arguments` for consistency
 
 ## Complete Examples
@@ -390,7 +421,7 @@ This provides detailed logs showing:
 ### Debug Logs Example
 
 ```
-2024-12-21 10:30:00 - rkllama.format_utils - DEBUG - Searching tools with standard method: get_tool_calls_standard
+2024-12-21 10:30:00 - rkllama.format_utils - DEBUG - Searching tool calls in <tool_call> blocks: extract_tool_calls
 2024-12-21 10:30:00 - rkllama.format_utils - DEBUG - Searching tools with generic method: get_tool_calls_generic
 2024-12-21 10:30:00 - rkllama.server_utils - DEBUG - Tool calls detected: [{'function': {'name': 'get_weather', 'arguments': {'location': 'Paris'}}}]
 ```

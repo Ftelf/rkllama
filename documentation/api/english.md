@@ -378,6 +378,7 @@ When a model calls a tool, the response includes `tool_calls`:
 | Model Type | Format | Support Level |
 |------------|--------|---------------|
 | **Qwen 2.5+** | `<tool_call></tool_call>` tags | ✅ Native |
+| **Qwen3.5** | `<tool_call>` with `<function=...>` XML | ✅ Native |
 | **Llama 3.2+** | Generic JSON detection | ✅ Full |
 | **Other LLMs** | Fallback JSON parsing | ✅ Compatible |
 
