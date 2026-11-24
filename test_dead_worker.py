@@ -71,17 +71,22 @@ def _real_worker(name, process):
     """A worker entry with a real process, a real task queue and a real abort flag."""
     return types.SimpleNamespace(
         process=process, task_queue=SPAWN.Queue(), abort_flag=SPAWN.Value('b', False),
+        pipe_closed_without_result=False,
         worker_model_info=types.SimpleNamespace(model=name, last_call=None, expires_at=None))
 
 
 class _FakeProcess:
     """Stands in for a worker's multiprocessing.Process in the load/reap tests."""
 
+    pid = 4242
+
     def __init__(self, alive, exitcode=None, on_is_alive=None):
         self.alive = alive
         self.exitcode = exitcode
         self.on_is_alive = on_is_alive
         self.joined = False
+        self.join_timeouts = []
+        self.killed = False
 
     def is_alive(self):
         if self.on_is_alive is not None:
@@ -91,6 +96,10 @@ class _FakeProcess:
 
     def join(self, timeout=None):
         self.joined = True
+        self.join_timeouts.append(timeout)
+
+    def kill(self):
+        self.killed = True
 
 
 class _FakeQueue:
@@ -108,6 +117,7 @@ class _FakeQueue:
 def _fake_worker(name, process, domain=1):
     return types.SimpleNamespace(
         process=process, task_queue=_FakeQueue(), abort_flag=types.SimpleNamespace(value=False),
+        pipe_closed_without_result=False,
         worker_model_info=types.SimpleNamespace(model=name, size=0, base_domain_id=[domain],
                                                 last_call=None, expires_at=None))
 
@@ -328,6 +338,218 @@ def test_gguf_worker_whose_load_started_no_process_is_dropped(env, entry):
         assert "m" not in env.manager.workers, "the reaper kept a worker without a process"
         assert calls == []
     assert broken.task_queue.closed, "the worker without a process was not cleaned up"
+
+
+# --- a reader saw the worker's pipe close, the process is not reapable yet ---------
+#
+# On RK3588 a SIGKILLed RKLLM worker closes its request pipe about 1 s before its
+# process can be reaped (rk-sbox api-e2e-chaos, ed42274): a request sent right
+# after the failed one still found the worker "alive" and was queued to it.
+
+class _NotYetReaped:
+    """Wraps a real worker process and reports it running until join() is
+    called, like a killed worker that already closed its pipes but is still
+    tearing down (releasing NPU memory)."""
+
+    def __init__(self, process):
+        self._process = process
+        self.join_timeouts = []
+
+    @property
+    def sentinel(self):
+        return self._process.sentinel
+
+    @property
+    def pid(self):
+        return self._process.pid
+
+    @property
+    def exitcode(self):
+        return self._process.exitcode if self.join_timeouts else None
+
+    def is_alive(self):
+        return not self.join_timeouts
+
+    def join(self, timeout=None):
+        self._process.join(timeout)
+        self.join_timeouts.append(timeout)
+
+
+def test_request_right_after_the_pipe_closed_reloads_the_not_yet_reaped_worker(env):
+    process = _started_process()
+    dying = _NotYetReaped(process)
+    worker = _real_worker("m", dying)
+    worker_end = None
+    calls = []
+    env.manager.set_model_loader(_registering_loader(env, calls))
+    try:
+        env.manager.workers["m"] = worker
+        conn = env.manager._send_tracked_task("m", ("TASK",))
+        worker_end, task = worker.task_queue.get(timeout=5)
+
+        # The worker is killed: the kernel closes its pipe first, the process is still running
+        worker_end.close()
+        assert conn.poll(5) is True
+        with pytest.raises(EOFError):
+            conn.recv()
+        conn.close()
+        _kill(process)  # it exits now, but only a join() reaps it (_NotYetReaped)
+
+        assert env.manager.load_and_begin_request("m") is None
+
+        assert calls == ["m"], f"the model whose worker closed its pipe was loaded {len(calls)} times"
+        assert env.manager.workers["m"] is not worker, "the next request was queued to the dying worker"
+        assert env.manager._busy == {"m": 1}
+        assert dying.join_timeouts[0] == env.worker_mod.DEAD_WORKER_EXIT_WAIT_SECONDS, \
+            f"the dying worker was not given a bounded join first: {dying.join_timeouts}"
+        assert worker.pipe_closed_without_result is True
+    finally:
+        if worker_end is not None:
+            worker_end.close()
+        worker.task_queue.close()
+        if process.is_alive():
+            process.kill()
+        process.join(10)
+
+
+def test_dead_signal_seen_by_poll_flags_the_not_yet_reaped_worker(env):
+    """The worker dies with the task still queued, so its pipe never reaches
+    EOF and poll() reports the death through the process sentinel, before any
+    recv(). That alone must flag the Worker object: the next request reloads
+    the model although the process is not reaped yet (_NotYetReaped)."""
+    process = _started_process()
+    dying = _NotYetReaped(process)
+    worker = _real_worker("m", dying)
+    calls = []
+    env.manager.set_model_loader(_registering_loader(env, calls))
+    try:
+        env.manager.workers["m"] = worker
+        conn = env.manager._send_tracked_task("m", ("TASK",))
+        _kill(process)
+
+        assert conn.poll(5) is True, "poll() did not report the dead worker"
+        assert worker.pipe_closed_without_result is True, "the death seen by poll() did not flag the worker"
+        conn.close()
+
+        assert env.manager.load_and_begin_request("m") is None
+        assert calls == ["m"], f"the model whose worker died was loaded {len(calls)} times"
+        assert env.manager.workers["m"] is not worker
+        assert env.manager._busy == {"m": 1}
+    finally:
+        worker.task_queue.close()
+        if process.is_alive():
+            process.kill()
+        process.join(10)
+
+
+def test_a_finished_request_does_not_flag_a_live_worker(env):
+    """CONTROL: the worker answers and closes its end; the reader takes the
+    answer and closes (as every reader does after the final message). The live
+    worker is not flagged and the next request uses it as it is."""
+    process = _started_process()
+    worker = _real_worker("m", process)
+    worker_end = None
+    calls = []
+    env.manager.set_model_loader(_registering_loader(env, calls))
+    try:
+        env.manager.workers["m"] = worker
+        conn = env.manager._send_tracked_task("m", ("TASK",))
+        worker_end, task = worker.task_queue.get(timeout=5)
+        worker_end.send(("FINISHED", 1, 2, 3, 4))
+        worker_end.close()
+
+        assert conn.poll(5) is True and conn.recv() == ("FINISHED", 1, 2, 3, 4)
+        conn.close()
+
+        assert worker.pipe_closed_without_result is False, "a request that got its answer flagged the worker"
+        assert env.manager.load_and_begin_request("m") is None
+        assert calls == [] and env.manager.workers["m"] is worker
+        assert process.is_alive()
+    finally:
+        if worker_end is not None:
+            worker_end.close()
+        worker.task_queue.close()
+        process.kill()
+        process.join(10)
+
+
+def test_flagged_worker_still_running_after_the_bounded_join_is_kept(env, caplog):
+    """A live worker can close a request pipe without a result (e.g. an
+    embedding run that produced nothing): after the bounded join it is still
+    running, so it is neither dropped nor killed, and the error names it."""
+    caplog.set_level("ERROR", logger="rkllama.worker")
+    calls = []
+    env.manager.set_model_loader(_registering_loader(env, calls))
+    running = _live_fake_worker("m")
+    running.pipe_closed_without_result = True
+    env.manager.workers["m"] = running
+
+    assert env.manager.load_and_begin_request("m") is None
+
+    assert calls == [], "a running worker was replaced"
+    assert env.manager.workers["m"] is running
+    assert env.manager._busy == {"m": 1}
+    assert running.process.join_timeouts == [env.worker_mod.DEAD_WORKER_EXIT_WAIT_SECONDS], running.process.join_timeouts
+    assert not running.process.killed, "the running worker was killed"
+    assert not running.task_queue.closed, "the running worker's task queue was closed"
+    errors = [r.getMessage() for r in caplog.records if r.name == "rkllama.worker" and r.levelname == "ERROR"]
+    assert len(errors) == 1 and "m" in errors[0] and "pid 4242" in errors[0], errors
+    assert running.pipe_closed_without_result is False, "the next request would wait for the running worker again"
+
+
+def test_flag_on_the_old_worker_does_not_touch_its_replacement(env, caplog):
+    """The old worker's reader sees EOF after a replacement was registered: only
+    the old Worker object is flagged; the replacement is used as it is."""
+    caplog.set_level("ERROR", logger="rkllama.worker")
+    calls = []
+    env.manager.set_model_loader(_registering_loader(env, calls))
+    old = _live_fake_worker("m")
+    env.manager.workers["m"] = old
+    conn = env.manager._send_tracked_task("m", ("TASK",))
+    (worker_end, task), = old.task_queue.items
+    replacement = _live_fake_worker("m")
+    env.manager.workers["m"] = replacement
+    try:
+        worker_end.close()
+        assert conn.poll(1) is True
+        with pytest.raises(EOFError):
+            conn.recv()
+    finally:
+        worker_end.close()
+        conn.close()
+
+    assert old.pipe_closed_without_result is True
+    assert replacement.pipe_closed_without_result is False, "the flag hit the replacement worker"
+    assert env.manager.load_and_begin_request("m") is None
+    assert calls == [] and env.manager.workers["m"] is replacement
+    assert replacement.process.join_timeouts == [], "the replacement was treated as a dying worker"
+    assert [r for r in caplog.records if r.levelname == "ERROR"] == []
+
+
+def test_closing_the_pipe_on_the_server_side_does_not_flag_the_worker(env):
+    """Client gone / reader timeout: the server closes its own end. Reading
+    from it afterwards raises OSError, which is not the worker's pipe closing:
+    the worker must not be flagged."""
+    process = _started_process()
+    worker = _real_worker("m", process)
+    calls = []
+    env.manager.set_model_loader(_registering_loader(env, calls))
+    try:
+        env.manager.workers["m"] = worker
+        conn = env.manager._send_tracked_task("m", ("TASK",))
+        conn.close()
+        with pytest.raises(OSError):
+            conn.poll(0)
+        with pytest.raises(OSError):
+            conn.recv()
+
+        assert worker.pipe_closed_without_result is False, "the server's own close flagged the worker"
+        assert env.manager.load_and_begin_request("m") is None
+        assert calls == [] and env.manager.workers["m"] is worker
+    finally:
+        worker.task_queue.close()
+        process.kill()
+        process.join(10)
 
 
 # --- reaper -------------------------------------------------------------------------

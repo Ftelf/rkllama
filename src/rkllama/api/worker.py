@@ -708,6 +708,13 @@ def run_rknn_process(name, task, model_input):
         return None
 
 
+# How long a request waits, holding the workers lock, for a worker whose request pipe closed
+# without a result to exit before its model is reloaded. A SIGKILLed RKLLM worker (2.9 GB model,
+# RK3588) became reapable about 1 s after its pipe closed; 3 s leaves margin for bigger models
+# while bounding the stall of other requests' load/busy bookkeeping.
+DEAD_WORKER_EXIT_WAIT_SECONDS = 3
+
+
 class TrackedConnection:
     """Parent end of a request pipe that keeps its model marked busy until closed.
 
@@ -721,7 +728,8 @@ class TrackedConnection:
     of the worker's end until a process unpickles it, which a dead worker never
     does. So poll() also waits on the process sentinel and reports a dead worker
     as ready; recv() then returns what the worker sent before it died and raises
-    EOFError after that.
+    EOFError after that. Either way (sentinel, or the pipe itself at EOF) it flags
+    the Worker object (pipe_closed_without_result) so the next request reloads it.
     """
 
     def __init__(self, conn, release, worker):
@@ -747,6 +755,7 @@ class TrackedConnection:
             return True
         if self._sentinel in ready:
             self._worker_died = True
+            self._worker.pipe_closed_without_result = True
             logger.error(f"Worker of model {self._worker.worker_model_info.model} exited "
                          f"(exitcode={self._worker.process.exitcode}) without finishing the request.")
             return True
@@ -757,7 +766,14 @@ class TrackedConnection:
         if self._worker_died and not self._conn.poll():
             raise EOFError(f"The worker of model '{self._worker.worker_model_info.model}' exited "
                            f"(exitcode={self._worker.process.exitcode}) without finishing the request.")
-        return self._conn.recv()
+        try:
+            return self._conn.recv()
+        except EOFError:
+            # The worker's end closed without a result. A killed worker closes its pipes about a second
+            # before its process can be reaped (NPU memory teardown), so remember it on this worker object:
+            # the next request then reloads the model instead of queueing to the dying worker
+            self._worker.pipe_closed_without_result = True
+            raise
 
     def request_abort(self):
         """Ask the worker this request went to to abort it (no lookup by model
@@ -942,20 +958,40 @@ class WorkerManager:
                     self._drop_dead_worker_locked(model_name, worker)
 
     def _is_worker_dead(self, worker) -> bool:
-        """True if the worker's process was started and has exited, or if the
-        worker has no process at all: a GGUF load whose every domain attempt
-        returned -1 registers the worker with process == -1 (no llama-server)."""
+        """True if the worker's process was started and has exited, if a request
+        reader saw its pipe close without a result (TrackedConnection; the process
+        may not be reapable yet), or if the worker has no process at all: a GGUF
+        load whose every domain attempt returned -1 registers the worker with
+        process == -1 (no llama-server)."""
         proc = worker.process
         if proc is None:
             return False
         if isinstance(proc, int):
+            return True
+        if worker.pipe_closed_without_result:
             return True
         return not self.is_process_alive(proc) and self.get_process_exitcode(proc) is not None
 
     def _drop_dead_worker_locked(self, model_name, worker) -> None:
         """Clean up a worker whose process died and remove its entry, but only if
         that same worker object is still registered under model_name. Caller must
-        hold self._workers_cond."""
+        hold self._workers_cond.
+
+        A worker flagged by a request reader whose process is still running gets
+        DEAD_WORKER_EXIT_WAIT_SECONDS to exit. If it is still running then, it is
+        neither dropped nor killed (no orphaned process holding NPU memory): the
+        entry stays and the flag is cleared."""
+        proc = worker.process
+        if not isinstance(proc, int) and worker.pipe_closed_without_result and self.is_process_alive(proc):
+            # A killed worker closes its pipes about a second before it can be reaped
+            self.join_process(proc, timeout=DEAD_WORKER_EXIT_WAIT_SECONDS)
+            if self.is_process_alive(proc):
+                logger.error(
+                    f"Worker of model {model_name} (pid {proc.pid}) closed a request pipe without a result "
+                    f"but is still running after {DEAD_WORKER_EXIT_WAIT_SECONDS} s: keeping it loaded."
+                )
+                worker.pipe_closed_without_result = False
+                return
         if isinstance(worker.process, int):
             # No process to join (see _is_worker_dead)
             logger.warning(
@@ -1895,6 +1931,9 @@ class Worker:
         self.process = None
         self.task_queue = Queue()
         self.abort_flag = Value('b', False)
+        # Set by a request reader that saw this worker's end of the request pipe close without
+        # a result: the worker is dead or dying, even while its process cannot be reaped yet
+        self.pipe_closed_without_result = False
 
 
     def create_worker_process(self, base_domain_ids, model_path, model_dir, options=None, lora_model_path = None, prompt_cache_path = None) -> bool:
