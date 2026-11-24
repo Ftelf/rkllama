@@ -11,7 +11,7 @@ import rkllama.api.variables as variables
 from .worker import worker_error_message, WORKER_TASK_ERROR
 from transformers import AutoTokenizer
 from flask import jsonify, Response, stream_with_context
-from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, handle_ollama_response, handle_ollama_embedding_response, get_base64_image_from_pil, get_url_image_from_pil
+from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, extract_tool_calls, handle_ollama_response, handle_ollama_embedding_response, get_base64_image_from_pil, get_url_image_from_pil
 from .model_utils import get_property_modelfile, context_length_from_options, prompt_too_long_message
 from .worker import ModelSlotsBusy
 import rkllama.config
@@ -510,15 +510,24 @@ class ChatEndpointHandler(EndpointHandler):
 
                     # Final check for tool calls in the complete response
                     if tools:
-                        json_tool_calls = get_tool_calls("".join(final_response_tokens))
+                        json_tool_calls = get_tool_calls("".join(final_response_tokens), tools)
                         
                         # Last check for non standard <tool_call> token and tools calls only when finished before the wait token time
                         if len(final_response_tokens) < max_token_to_wait_for_tool_call:
                             if not tool_calls and json_tool_calls:
                                 tool_calls = True
 
+                    # A <tool_call> tag was seen, so the answer was held back, but no call could be parsed
+                    # from it: send the answer as text instead of an empty tool_calls list without content
+                    if tools and tool_calls and not json_tool_calls:
+                        logger.info(f"Streamed answer of model {model_name} has a <tool_call> tag but no parsable call; sending it as text")
+                        tool_calls = False
+                        for temp_token in response_tokens:
+                            time.sleep(0.1) # Simulate delay to stream previos tokens
+                            chunk = cls.format_streaming_chunk(model_name=model_name, token=temp_token)
+                            yield f"{json.dumps(chunk)}\n"
                     # If tool calls detected, send them as final response
-                    if tools and tool_calls:
+                    elif tools and tool_calls:
                         chunk_tool_call = cls.format_streaming_chunk(model_name=model_name, token=json_tool_calls, tool_calls=tool_calls)
                         yield f"{json.dumps(chunk_tool_call)}\n"
                     elif len(final_response_tokens)  < max_token_to_wait_for_tool_call: 
@@ -633,7 +642,13 @@ class ChatEndpointHandler(EndpointHandler):
         metrics["eval"] = eval
         
         format_data = None
-        tool_calls = get_tool_calls(complete_text) if tools else None
+        tool_calls = None
+        tool_call_content = ""
+        if tools:
+            tool_calls, content_without_calls, used_xml = extract_tool_calls(complete_text, tools)
+            # The XML form (Qwen3.5) keeps the text around the parsed blocks; the JSON form keeps
+            # today's empty content
+            tool_call_content = content_without_calls if used_xml else ""
         if format_spec and complete_text and not tool_calls:
             success, parsed_data, error, cleaned_json = validate_format_response(complete_text, format_spec)
             if success and parsed_data:
@@ -651,7 +666,7 @@ class ChatEndpointHandler(EndpointHandler):
            format_data = {
                    "format_type" : "json",
                    "parsed": "",
-                   "cleaned_json": "",
+                   "cleaned_json": tool_call_content,
                    "tool_call": tool_calls
            }
 
