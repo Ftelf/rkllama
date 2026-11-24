@@ -158,13 +158,19 @@ def _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name):
     never returns, the model stays busy for good and the dead-worker detection
     (#23) does not see it (no EOF, the process is alive).
     """
+    started = time.monotonic()
     try:
         # Only a running run is aborted: what rkllm_abort does to an idle handle is unknown
-        if thread_model.is_alive():
+        aborted = thread_model.is_alive()
+        if aborted:
             logger.info(f"Aborting inference for model {name}...")
             model_rkllm.abort()
         thread_model.join()
+        joined = time.monotonic()
         model_rkllm.clear_cache()
+        # Evidence of how long rkllm_abort takes to end a run on the board
+        logger.info(f"Run of model {name} stopped after {(time.monotonic() - started) * 1000:.0f} ms "
+                    f"(aborted={aborted}, abort+join {(joined - started) * 1000:.0f} ms)")
     finally:
         # A reader that timed out sets the flag and closes its pipe; whichever the
         # worker noticed first, the flag belonged to this run and must not abort the

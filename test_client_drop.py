@@ -33,6 +33,7 @@ import importlib.util
 import logging
 import multiprocessing
 import queue
+import re
 import sys
 import threading
 import time
@@ -198,6 +199,16 @@ def _drop_after_first_token(env, conn):
     conn.close()
 
 
+def _assert_one_stop_line(caplog, aborted):
+    """The stop sequence logs one INFO line with its durations (hardware evidence of
+    how long rkllm_abort takes) that says whether abort() was called."""
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "rkllama.worker" and r.levelno == logging.INFO and "stopped after" in r.getMessage()]
+    assert len(lines) == 1, lines
+    pattern = rf"Run of model fake-model stopped after \d+ ms \(aborted={aborted}, abort\+join \d+ ms\)"
+    assert re.fullmatch(pattern, lines[0]), lines[0]
+
+
 def _run_dropped_client_then_live_client(env):
     dropped = _inference(env, LONG_RUN, "a")
     live = _inference(env, SHORT_RUN, "b")
@@ -217,6 +228,7 @@ def test_dropped_client_stops_the_run_before_the_next_task(env, caplog):
     assert dropped_run["tag"] == "a" and dropped_run["aborted"], runtime.runs
     assert dropped_run["produced"] < LONG_RUN, "the dropped run went on to its end"
     assert runtime.abort_calls == [1], runtime.abort_calls
+    _assert_one_stop_line(caplog, aborted=True)
     # Nothing is reported to the closed pipe, and the drop is not handled as a task failure
     problems = [r.getMessage() for r in caplog.records if r.name == "rkllama.worker" and r.levelno >= logging.WARNING]
     assert problems == [], problems
@@ -325,6 +337,7 @@ def test_client_gone_at_the_final_drain_stops_without_aborting_an_ended_run(env,
     _assert_complete_answer(env, second_answer, "b", SHORT_RUN)
     runtime = env.runtime
     assert runtime.abort_calls == [], f"abort() on an ended run: {runtime.abort_calls}"
+    _assert_one_stop_line(caplog, aborted=False)
     assert runtime.max_active == 1, runtime.max_active
     # the stop sequence's clear_cache + the CLEAR_CACHE after each inference
     assert runtime.clear_cache_calls == [0, 0, 0], runtime.clear_cache_calls
