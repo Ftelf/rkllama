@@ -39,7 +39,7 @@ def _server_utils(monkeypatch):
     transformers.AutoTokenizer = object
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     format_utils = types.ModuleType("rkllama.api.format_utils")
-    for name in ("create_format_instruction", "validate_format_response", "get_tool_calls", "handle_ollama_response",
+    for name in ("create_format_instruction", "validate_format_response", "get_tool_calls", "extract_tool_calls", "handle_ollama_response",
                  "handle_ollama_embedding_response", "get_base64_image_from_pil", "get_url_image_from_pil"):
         setattr(format_utils, name, lambda *a, **k: None)
     monkeypatch.setitem(sys.modules, "rkllama.api.format_utils", format_utils)
