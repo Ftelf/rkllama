@@ -378,6 +378,7 @@ Quand un modèle appelle un outil, la réponse inclut `tool_calls` :
 | Type de Modèle | Format | Niveau de Support |
 |-----------------|--------|-------------------|
 | **Qwen 2.5+** | Balises `<tool_call></tool_call>` | ✅ Natif |
+| **Qwen3.5** | `<tool_call>` avec XML `<function=...>` | ✅ Natif |
 | **Llama 3.2+** | Détection JSON générique | ✅ Complet |
 | **Autres LLMs** | Analyse JSON de fallback | ✅ Compatible |
 
