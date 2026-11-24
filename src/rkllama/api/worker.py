@@ -133,6 +133,45 @@ def _safe_send(conn, value, context):
         logger.warning(f"Could not deliver {context}: the requesting client already disconnected")
 
 
+def _send_to_client(conn, value, name):
+    """Send one message of a running answer. Returns False instead of raising
+    when the requesting client already closed its end (e.g. a "stop" click in
+    a chat UI), so the worker can stop the run rather than fail the task while
+    the model thread keeps running (issue #24).
+    """
+    try:
+        conn.send(value)
+        return True
+    except (BrokenPipeError, OSError) as e:
+        logger.info(f"The client of model {name} disconnected during the answer ({e}): stopping the run")
+        return False
+
+
+def _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name):
+    """Stop the run of ``thread_model`` and wait until it has ended, so the next
+    task (CLEAR_CACHE, the next INFERENCE) never uses the runtime handle while a
+    run still does (issue #24).
+
+    join() has no timeout on purpose: a busy worker is still correct, a second
+    run on the same handle is not. It is bounded only if rkllm_run returns after
+    rkllm_abort (decoding by max_new_tokens, prefill by the context length); if it
+    never returns, the model stays busy for good and the dead-worker detection
+    (#23) does not see it (no EOF, the process is alive).
+    """
+    try:
+        # Only a running run is aborted: what rkllm_abort does to an idle handle is unknown
+        if thread_model.is_alive():
+            logger.info(f"Aborting inference for model {name}...")
+            model_rkllm.abort()
+        thread_model.join()
+        model_rkllm.clear_cache()
+    finally:
+        # A reader that timed out sets the flag and closes its pipe; whichever the
+        # worker noticed first, the flag belonged to this run and must not abort the
+        # next one, also when abort() or clear_cache() raised
+        abort_flag.value = False
+
+
 def worker_error_message(message):
     """Return the error text if ``message`` is a worker error report, else None.
 
@@ -274,6 +313,8 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
     # Initialize individual callback for each worker to prevent error from RKLLM
     from .callback import callback_impl, global_text, last_embeddings, global_metrics
+    # callback.py rebinds split_byte_data (``global``), so it is reset on the module, not imported
+    from . import callback as callback_module
     from .rkllm import RKLLM
 
     # Connect the callback function between Python and C++ independently for each worker
@@ -295,6 +336,9 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
     # Loop to wait for tasks
     while True:
+
+        # The model thread of the current task, if it starts one (checked by the error handler below)
+        thread_model = None
 
         try:
         
@@ -327,12 +371,17 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                 # global_text is module-level and outlives a request: tokens left by an aborted or failed
                 # run must not be sent as the start of this answer
                 global_text.clear()
+                # Partial UTF-8 bytes left by an aborted or cut run would be glued to this run's first
+                # token: that never decodes, so every token of every later answer would be dropped
+                callback_module.split_byte_data = bytes(b"")
                 # Run inference
                 thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input, options))
                 thread_model.start()
                 
                 # Looping until execution of the thread
                 thread_finished = False
+                # The requesting client closed its end: nobody reads this answer any more
+                client_gone = False
                 while not thread_finished:
 
                     # Check for abort of inference
@@ -343,8 +392,12 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                     tokens_processed = False
                     while len(global_text) > 0:
                         token = global_text.pop(0)
-                        child_conn.send(token)
+                        if not _send_to_client(child_conn, token, name):
+                            client_gone = True
+                            break
                         tokens_processed = True
+                    if client_gone:
+                        break
 
                     # Update status of the thread
                     thread_model.join(timeout=0.001)
@@ -356,18 +409,24 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
                 # The model thread can append its last token between the drain above and join(): drain once
                 # more, or that token is lost for this answer and stays in global_text for the next request
-                if not abort_flag.value:
+                if not abort_flag.value and not client_gone:
                     while len(global_text) > 0:
-                        child_conn.send(global_text.pop(0))
+                        if not _send_to_client(child_conn, global_text.pop(0), name):
+                            client_gone = True
+                            break
+
+                if client_gone:
+                    # The run must end before the next task (the CLEAR_CACHE queued after every
+                    # inference, the next INFERENCE) uses the runtime handle. Nothing is reported:
+                    # the client's end is closed
+                    _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name)
+                    child_conn.close()
+                    continue
 
                 # Check for abort of inference
                 if abort_flag.value:
-                    # Abort the current inference of the model
-                    logger.info(f"Aborting inference for model {name}...")
-                    model_rkllm.abort()
-                    model_rkllm.clear_cache()
-                    # Reset the flag
-                    abort_flag.value = False
+                    # Abort the current inference of the model, wait until it has ended, reset the flag
+                    _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name)
                     # Empty stats
                     prompt_token_count=0
                     token_count=0
@@ -437,6 +496,9 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
         except Exception as e:
             logger.error(f"Failed executing task the worker for model '{name}': {str(e)}")
+            # Whatever failed, the run of this task must not go on while the worker takes the next task
+            if thread_model is not None and thread_model.is_alive():
+                _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name)
             _safe_send(child_conn, WORKER_TASK_ERROR, f"error report for model {name}")
 
             # Close the connection
