@@ -14,6 +14,7 @@ import atexit
 import subprocess
 import configparser
 from multiprocessing import Process, Queue, Value, Pipe, parent_process
+from multiprocessing.connection import wait
 
 
 
@@ -714,15 +715,54 @@ class TrackedConnection:
     that never does (client gone mid-stream, exception) still releases the model
     when this object is garbage collected, so a lost request cannot pin the model
     as busy forever.
+
+    It also watches the worker process the task was sent to. A task queued to a
+    worker that died never reaches EOF on this pipe: the queue keeps a duplicate
+    of the worker's end until a process unpickles it, which a dead worker never
+    does. So poll() also waits on the process sentinel and reports a dead worker
+    as ready; recv() then returns what the worker sent before it died and raises
+    EOFError after that.
     """
 
-    def __init__(self, conn, release):
+    def __init__(self, conn, release, worker):
         self._conn = conn
         self._release = release
+        # The worker this request went to, kept even if it is unloaded or replaced meanwhile
+        self._worker = worker
+        # Only multiprocessing workers have a sentinel; others fall back to a plain poll
+        self._sentinel = getattr(worker.process, "sentinel", None)
+        self._worker_died = False
 
     def __getattr__(self, name):
-        # poll / recv / fileno / ... go to the real connection
+        # fileno / closed / ... go to the real connection
         return getattr(self._conn, name)
+
+    def poll(self, timeout=0.0):
+        if self._worker_died:
+            return True
+        if self._sentinel is None:
+            return self._conn.poll(timeout)
+        ready = wait([self._conn, self._sentinel], timeout)
+        if self._conn in ready:
+            return True
+        if self._sentinel in ready:
+            self._worker_died = True
+            logger.error(f"Worker of model {self._worker.worker_model_info.model} exited "
+                         f"(exitcode={self._worker.process.exitcode}) without finishing the request.")
+            return True
+        return False
+
+    def recv(self):
+        # Whatever the worker sent before it died is still in the pipe: deliver it first
+        if self._worker_died and not self._conn.poll():
+            raise EOFError(f"The worker of model '{self._worker.worker_model_info.model}' exited "
+                           f"(exitcode={self._worker.process.exitcode}) without finishing the request.")
+        return self._conn.recv()
+
+    def request_abort(self):
+        """Ask the worker this request went to to abort it (no lookup by model
+        name: the model may have been unloaded or replaced meanwhile)."""
+        self._worker.abort_flag.value = True
 
     def _release_once(self):
         release, self._release = self._release, None
@@ -892,35 +932,56 @@ class WorkerManager:
         returns False for such zombies. Without this reaper, ``self.workers``
         would keep the stale entry forever, causing ``api/ps`` to lie and
         preventing a fresh load of the same model.
-        """
-        dead = []
-        for model_name, worker in list(self.workers.items()):
-            proc = worker.process
-            if proc is None:
-                continue
-            if not self.is_process_alive(proc) and self.get_process_exitcode(proc) is not None:
-                dead.append((model_name, self.get_process_exitcode(proc)))
 
-        for model_name, exitcode in dead:
+        Holds self._workers_cond, so it never removes a worker that a concurrent
+        load registered in place of the dead one.
+        """
+        with self._workers_cond:
+            for model_name, worker in list(self.workers.items()):
+                if self._is_worker_dead(worker):
+                    self._drop_dead_worker_locked(model_name, worker)
+
+    def _is_worker_dead(self, worker) -> bool:
+        """True if the worker's process was started and has exited, or if the
+        worker has no process at all: a GGUF load whose every domain attempt
+        returned -1 registers the worker with process == -1 (no llama-server)."""
+        proc = worker.process
+        if proc is None:
+            return False
+        if isinstance(proc, int):
+            return True
+        return not self.is_process_alive(proc) and self.get_process_exitcode(proc) is not None
+
+    def _drop_dead_worker_locked(self, model_name, worker) -> None:
+        """Clean up a worker whose process died and remove its entry, but only if
+        that same worker object is still registered under model_name. Caller must
+        hold self._workers_cond."""
+        if isinstance(worker.process, int):
+            # No process to join (see _is_worker_dead)
+            logger.warning(
+                "Worker for model '%s' has no process (process=%s, its load started none); "
+                "cleaning up stale entry.",
+                model_name, worker.process,
+            )
+        else:
             logger.warning(
                 "Worker for model '%s' died unexpectedly (exitcode=%s); "
                 "cleaning up stale entry.",
-                model_name, exitcode,
+                model_name, self.get_process_exitcode(worker.process),
             )
+            # Reap the zombie if it's still in the process table
             try:
-                worker = self.workers[model_name]
-                # Reap the zombie if it's still in the process table
-                try:
-                    self.join_process(worker.process,timeout=1)
-                except Exception:
-                    pass
-                try:
-                    self.workers[model_name].task_queue.close()
-                except Exception:
-                    pass
-                del self.workers[model_name]
-            except KeyError:
-                pass
+                self.join_process(worker.process, timeout=1)
+            except Exception as e:
+                logger.warning(f"Could not join the dead worker of model {model_name}: {e}")
+        try:
+            worker.task_queue.close()
+        except Exception as e:
+            logger.warning(f"Could not close the task queue of the dead worker of model {model_name}: {e}")
+        if self.workers.get(model_name) is worker:
+            del self.workers[model_name]
+            # Its NPU domain is free now: wake loads waiting for one
+            self._workers_cond.notify_all()
 
     def unload_expired_models(self) -> int | None:
         """
@@ -1080,8 +1141,14 @@ class WorkerManager:
         Returns None (the caller must end_request) or an error message (the
         model is not marked busy). Raises ModelSlotsBusy if no model slot
         frees up within max_seconds_waiting_worker_response.
+
+        A model whose worker process died (crash, OOM kill) is loaded again
+        instead of queueing the request to the dead worker.
         """
         with self._workers_cond:
+            worker = self.workers.get(model_name)
+            if worker is not None and self._is_worker_dead(worker):
+                self._drop_dead_worker_locked(model_name, worker)
             if model_name not in self.workers:
                 if self._model_loader is None:
                     return f"Model '{model_name}' is not loaded."
@@ -1302,21 +1369,25 @@ class WorkerManager:
         Returns:
             Connection: pipe connection to receive the response.
         """
-        if model_name in self.workers:
-
-            # Declare the pipe for the current task to return
-            parent_conn, child_conn = Pipe()
-
-            # Send the TASK to the model with the task queue and the pipe to send the response
-            self.workers[model_name].task_queue.put((child_conn,) + task)
-
-            # Update the worker model info with the invocation
-            self.update_last_call_for_model(model_name)
-
-            # Return the request parent pipe
-            return parent_conn
+        worker = self.workers.get(model_name)
+        if worker is not None:
+            return self._send_task_to(worker, model_name, task)
 
         return None
+
+    def _send_task_to(self, worker, model_name, task):
+        """send_task to this worker object (not looked up again by model name)."""
+        # Declare the pipe for the current task to return
+        parent_conn, child_conn = Pipe()
+
+        # Send the TASK to the model with the task queue and the pipe to send the response
+        worker.task_queue.put((child_conn,) + task)
+
+        # Update the worker model info with the invocation
+        self.update_last_call_for_model(model_name)
+
+        # Return the request parent pipe
+        return parent_conn
 
     
     def _send_tracked_task(self, model_name, task, before_send=None):
@@ -1328,13 +1399,16 @@ class WorkerManager:
             raise RuntimeError(f"Model '{model_name}' is not loaded (it may have been unloaded for another model). Try again.")
         try:
             prepared = before_send() if before_send is not None else None
-            parent_conn = self.send_task(model_name, task(prepared) if callable(task) else task)
-            if parent_conn is None:
+            # The task goes to this worker object, and the reader watches its process even if the
+            # model's entry is unloaded or replaced later
+            worker = self.workers.get(model_name)
+            if worker is None:
                 raise RuntimeError(f"Model '{model_name}' is not loaded. Try again.")
+            parent_conn = self._send_task_to(worker, model_name, task(prepared) if callable(task) else task)
         except BaseException:
             self.end_request(model_name)
             raise
-        return TrackedConnection(parent_conn, lambda: self.end_request(model_name))
+        return TrackedConnection(parent_conn, lambda: self.end_request(model_name), worker)
 
     def update_last_call_for_model(self, model_name):
         """
@@ -1342,8 +1416,14 @@ class WorkerManager:
         Args:
         model_name (str): Model to update
         """
+        worker = self.workers.get(model_name)
+        if worker is None:
+            # Unloaded meanwhile (expired, evicted, dead worker reaped): nothing to update
+            logger.debug(f"Model {model_name} is not loaded: last call not updated")
+            return
+
         # Update the last call of the model
-        self.workers[model_name].worker_model_info.last_call = datetime.now()
+        worker.worker_model_info.last_call = datetime.now()
 
         # Update the expiration of the model
         self.update_expiration_date_for_model(model_name)
@@ -1355,8 +1435,14 @@ class WorkerManager:
         Args:
         model_name (str): Model to update
         """
+        worker = self.workers.get(model_name)
+        if worker is None:
+            # Unloaded meanwhile (expired, evicted, dead worker reaped): nothing to update
+            logger.debug(f"Model {model_name} is not loaded: expiration not updated")
+            return
+
         # Update the expiration of the model
-        self.workers[model_name].worker_model_info.expires_at = datetime.now() + timedelta(minutes=int(rkllama.config.get("model", "max_minutes_loaded_in_memory")),)
+        worker.worker_model_info.expires_at = datetime.now() + timedelta(minutes=int(rkllama.config.get("model", "max_minutes_loaded_in_memory")),)
 
 
     def stop_worker(self, model_name, timeout=30):

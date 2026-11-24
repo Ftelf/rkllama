@@ -428,7 +428,7 @@ class ChatEndpointHandler(EndpointHandler):
 
                 else:
                     # Abort the current inference
-                    variables.worker_manager_rkllm.workers[model_name].abort_flag.value = True
+                    parent_pipe.request_abort()
                     
                     # Raise Exception
                     logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
@@ -584,7 +584,7 @@ class ChatEndpointHandler(EndpointHandler):
             else:
 
                 # Abort the current inference
-                variables.worker_manager_rkllm.workers[model_name].abort_flag.value = True
+                parent_pipe.request_abort()
 
                 # Raise Exception
                 logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
@@ -825,7 +825,7 @@ class GenerateEndpointHandler(EndpointHandler):
 
                 else:
                     # Abort the current inference
-                    variables.worker_manager_rkllm.workers[model_name].abort_flag.value = True
+                    parent_pipe.request_abort()
                     
                     # Raise Exception
                     logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
@@ -933,7 +933,7 @@ class GenerateEndpointHandler(EndpointHandler):
                 token = EndpointHandler.receive_worker_message(parent_pipe)
             else:
                 # Abort the current inference
-                variables.worker_manager_rkllm.workers[model_name].abort_flag.value = True
+                parent_pipe.request_abort()
                 
                 # Raise Exception
                 logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
@@ -1135,7 +1135,7 @@ class EmbedEndpointHandler(EndpointHandler):
                 last_embeddings = parent_pipe.recv()
             else:
                 # Abort the current inference
-                variables.worker_manager_rkllm.workers[model_name].abort_flag.value = True
+                parent_pipe.request_abort()
                 # Raise Exception
                 logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
                 # Send empty embedding
