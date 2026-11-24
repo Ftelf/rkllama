@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from typing import Any, Dict, Optional, Tuple, Union, List
 import re
 import copy
@@ -1160,32 +1161,250 @@ def get_tool_calls_generic(response):
     return tool_calls_renamed
 
 
-def get_tool_calls_standard(response):
-    """ Get all the tool calls indicated by the LLM in the response. 
-        Only work if the chat template of the LLM uses <tool_call></tool_call> tags (Like Qwen models)
-    """
-    
-    logger.debug(f"Searching tools with standard method: get_tool_calls_standard")
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_XML_BLOCK_START_RE = re.compile(r"\s*<function=")
+_XML_TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=")
+_XML_FUNCTION_OPEN = "<function="
+_XML_FUNCTION_CLOSE = "</function>"
+_XML_PARAMETER_OPEN = "<parameter="
+_XML_PARAMETER_CLOSE = "</parameter>"
+_XML_NAME_RE = re.compile(r"([^>\n]*)>")
+_XML_WHITESPACE_RE = re.compile(r"\s*")
+_INTEGER_RE = re.compile(r"-?[0-9]+")
+_JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")
+_NOT_CONVERTED = object()
 
+
+def _strict_json_loads(text):
+    """json.loads that rejects NaN / Infinity (they are not JSON and would make the response invalid JSON)."""
+    def reject_constant(name):
+        raise ValueError("non-finite number")
+
+    def finite_float(literal):
+        value = float(literal)
+        if not math.isfinite(value):
+            raise ValueError("non-finite number")
+        return value
+
+    return json.loads(text, parse_constant=reject_constant, parse_float=finite_float)
+
+
+def _to_int(text):
+    try:
+        return int(text)
+    except ValueError:   # more digits than int() accepts from a string (sys.set_int_max_str_digits)
+        return _NOT_CONVERTED
+
+
+def _convert_xml_value(text, type_name):
+    """Convert the stripped text of a parameter to `type_name`, or return _NOT_CONVERTED."""
+    if type_name == "integer":
+        return _to_int(text) if _INTEGER_RE.fullmatch(text) else _NOT_CONVERTED
+    if type_name == "number":
+        match = _JSON_NUMBER_RE.fullmatch(text)
+        if not match:
+            return _NOT_CONVERTED
+        if match.group(1) is None and match.group(2) is None:
+            return _to_int(text)
+        value = float(text)
+        return value if math.isfinite(value) else _NOT_CONVERTED
+    if type_name == "boolean":
+        lowered = text.lower()
+        if lowered in ("true", "false"):
+            return lowered == "true"
+        return _NOT_CONVERTED
+    if type_name == "null":
+        return None if text == "null" else _NOT_CONVERTED
+    if type_name in ("object", "array"):
+        try:
+            value = _strict_json_loads(text)
+        except (ValueError, RecursionError):
+            return _NOT_CONVERTED
+        expected = dict if type_name == "object" else list
+        return value if isinstance(value, expected) else _NOT_CONVERTED
+    return _NOT_CONVERTED
+
+
+def _schema_types(prop_schema):
+    """The type names a property schema allows, in the order they are tried: a single
+    `type`, a list of types, or the `type` of each `anyOf` / `oneOf` entry (one level).
+    "null" is tried first. A `$ref` or an unknown type counts as "string"."""
+    if not isinstance(prop_schema, dict) or "$ref" in prop_schema:
+        return ["string"]
+    declared = prop_schema.get("type")
+    if isinstance(declared, str):
+        names = [declared]
+    elif isinstance(declared, list):
+        names = list(declared)
+    else:
+        names = []
+        for key in ("anyOf", "oneOf"):
+            options = prop_schema.get(key)
+            if isinstance(options, list):
+                for option in options:
+                    if isinstance(option, dict) and "$ref" not in option and isinstance(option.get("type"), str):
+                        names.append(option["type"])
+                    else:
+                        names.append("string")
+                break
+    known = ("string", "integer", "number", "boolean", "null", "object", "array")
+    names = [name if name in known else "string" for name in names] or ["string"]
+    if "null" in names:
+        names = ["null"] + [name for name in names if name != "null"]
+    return names
+
+
+def _strip_one_newline(raw):
+    """`raw` minus exactly one leading and one trailing line break ("\\r\\n" or "\\n")."""
+    for newline in ("\r\n", "\n"):
+        if raw.startswith(newline):
+            raw = raw[len(newline):]
+            break
+    for newline in ("\r\n", "\n"):
+        if raw.endswith(newline):
+            raw = raw[:-len(newline)]
+            break
+    return raw
+
+
+def coerce_xml_value(raw, prop_schema):
+    """Turn the raw text of an XML tool-call parameter into the type its JSON schema
+    asks for. Without a usable schema, or when the text does not convert, the value
+    is a string: the raw text minus exactly one leading and one trailing line break
+    ("\\n" or "\\r\\n"). Types that are not strings are converted from the fully stripped text."""
+    as_string = _strip_one_newline(raw)
+    stripped = raw.strip()
+    for type_name in _schema_types(prop_schema):
+        if type_name == "string":
+            return as_string
+        value = _convert_xml_value(stripped, type_name)
+        if value is not _NOT_CONVERTED:
+            return value
+    return as_string
+
+
+def _tool_parameter_schemas(tools, function_name):
+    """The `properties` of the tool called `function_name` in the request's `tools`, or None."""
+    if not isinstance(tools, list):
+        return None
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(function, dict) and function.get("name") == function_name:
+            parameters = function.get("parameters")
+            properties = parameters.get("properties") if isinstance(parameters, dict) else None
+            return properties if isinstance(properties, dict) else None
+    return None
+
+
+def _read_xml_name(inner, pos):
+    """Read `NAME>` at pos; return (stripped name, position after '>') or None for a bad name."""
+    match = _XML_NAME_RE.match(inner, pos)
+    if not match:
+        return None
+    name = match.group(1).strip()
+    return (name, match.end()) if name else None
+
+
+def _parse_xml_tool_call_strict(inner, tools):
+    """Parse the text inside <tool_call>...</tool_call> in the XML form; return
+    (call, None) or (None, reason). The grammar is strict: whitespace, one
+    <function=NAME>, zero or more <parameter=PNAME>VALUE</parameter> separated only
+    by whitespace, </function>, whitespace."""
+    pos = _XML_WHITESPACE_RE.match(inner).end()
+    if not inner.startswith(_XML_FUNCTION_OPEN, pos):
+        return None, "no <function= at the start"
+    function = _read_xml_name(inner, pos + len(_XML_FUNCTION_OPEN))
+    if function is None:
+        return None, "empty or invalid function name"
+    function_name, pos = function
+    schemas = _tool_parameter_schemas(tools, function_name) or {}
+    arguments = {}
+    while True:
+        pos = _XML_WHITESPACE_RE.match(inner, pos).end()
+        if inner.startswith(_XML_FUNCTION_CLOSE, pos):
+            pos += len(_XML_FUNCTION_CLOSE)
+            break
+        if not inner.startswith(_XML_PARAMETER_OPEN, pos):
+            return None, "text between elements or missing </function>"
+        parameter = _read_xml_name(inner, pos + len(_XML_PARAMETER_OPEN))
+        if parameter is None:
+            return None, "empty or invalid parameter name"
+        parameter_name, pos = parameter
+        end = inner.find(_XML_PARAMETER_CLOSE, pos)
+        if end == -1:
+            return None, "missing </parameter>"
+        arguments[parameter_name] = coerce_xml_value(inner[pos:end], schemas.get(parameter_name))
+        pos = end + len(_XML_PARAMETER_CLOSE)
+    if inner[pos:].strip():
+        return None, "text after </function>"
+    return {"function": {"name": function_name, "arguments": arguments}}, None
+
+
+def parse_xml_tool_call(inner, tools=None):
+    """Parse one Qwen3-Coder / Qwen3.5 XML tool call (the text inside <tool_call>...</tool_call>):
+
+        <function=get_weather>
+        <parameter=city>
+        Paris
+        </parameter>
+        </function>
+
+    Returns {"function": {"name": ..., "arguments": {...}}}, or None when the text does
+    not follow the grammar exactly. Never raises: a block that cannot be parsed stays text.
+    Argument types come from the matching tool's JSON schema in `tools` (see coerce_xml_value)."""
+    try:
+        call, reason = _parse_xml_tool_call_strict(inner, tools)
+    except Exception as e:
+        logger.warning(f"XML tool call parser failed ({type(e).__name__}); the block stays text")
+        return None
+    if call is None:
+        logger.info(f"XML tool call block not parsed: {reason}; the block stays text")
+    return call
+
+
+def extract_tool_calls(response, tools=None):
+    """Find the tool calls in a model answer.
+
+    Returns (tool_calls, content, used_xml):
+      - tool_calls: [{"function": {"name": ..., "arguments": {...}}}, ...] in text order
+      - content: the answer with the <tool_call> blocks that gave a call removed, trimmed
+      - used_xml: True when at least one call came from the XML form
+
+    A <tool_call> block whose text starts with <function= is parsed by the XML parser only;
+    every other block by the JSON code (get_tool_calls_generic). When no block gives a call,
+    the whole answer is searched for JSON calls, except when it holds an XML block: a
+    parameter value of a broken XML block can look like a JSON call."""
+    logger.debug("Searching tool calls in <tool_call> blocks: extract_tool_calls")
     tool_calls = []
-    for tools in re.findall("<tool_call>(.*?)</tool_call>", response, re.DOTALL):
-      # tool_calls += [{ "function": json.loads(tool) } for tool in tools.split('\n') if tool]
-      # To make more smartt LLM in case LLM response inside <tool_call><t/ool_call> but with an extra word. 
-      # For example: <tool_call> Output : {"name": <function_name>, "arguments": <dictionary_of_argument_name_value>} </tool_call>
-      tool_calls += get_tool_calls_generic(tools) 
-    return tool_calls
+    used_xml = False
+    kept_text = []
+    last_end = 0
+    for block in _TOOL_CALL_BLOCK_RE.finditer(response):
+        inner = block.group(1)
+        if _XML_BLOCK_START_RE.match(inner):
+            call = parse_xml_tool_call(inner, tools)
+            block_calls = [call] if call else []
+            used_xml = used_xml or bool(call)
+        else:
+            # JSON form; words around the JSON are allowed, e.g.
+            # <tool_call> Output : {"name": <function_name>, "arguments": <dictionary_of_argument_name_value>} </tool_call>
+            block_calls = get_tool_calls_generic(inner)
+        if block_calls:
+            tool_calls += block_calls
+            kept_text.append(response[last_end:block.start()])
+            last_end = block.end()
+    kept_text.append(response[last_end:])
 
-
-def get_tool_calls(response):
-    """ Get all the tool calls indicated by the LLM in the response """
-    
-    # We try the standard form first
-    tool_calls = get_tool_calls_standard(response)
-
-    if not tool_calls:
+    if not tool_calls and not _XML_TOOL_CALL_RE.search(response):
         # No standard format tool call found. Search for more generic way
         tool_calls = get_tool_calls_generic(response)
 
+    return tool_calls, "".join(kept_text).strip(), used_xml
+
+
+def get_tool_calls(response, tools=None):
+    """ Get all the tool calls indicated by the LLM in the response """
+    tool_calls, _, _ = extract_tool_calls(response, tools)
     return tool_calls
 
 
