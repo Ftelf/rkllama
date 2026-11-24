@@ -645,7 +645,11 @@ def ollama_chat_stream_to_openai_chat_completions_chunks(ollama_stream_lines):
                 tool["id"] = f"call_{uuid.uuid4().hex}"
                 tool["type"] = "function"
                 tool["index"] = idx
-                tool["function"]["arguments"] = str(tool["function"]["arguments"]).replace("'", '"')
+                # OpenAI streams arguments as a JSON string (str(dict) is not JSON: True, None, apostrophes)
+                arguments = tool["function"]["arguments"]
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                tool["function"]["arguments"] = arguments
             delta["tool_calls"] = tool_calls
         
         chunk = {
