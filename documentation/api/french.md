@@ -389,6 +389,7 @@ Quand un modèle appelle un outil, la réponse inclut `tool_calls` :
 - **Normalisation des formats** - gère automatiquement `parameters` vs `arguments`
 - **Analyse JSON robuste** avec méthodes de fallback
 - **Appels d'outils multiples** dans une seule réponse
+- **Prise en compte du raisonnement** - avec le raisonnement activé (thinking), les appels ne sont cherchés qu'après `</think>` ; un appel esquissé pendant le raisonnement n'est pas un appel
 
 Pour la documentation complète, des exemples et le dépannage, voir le [Guide d'Appel d'Outils](./tools.md).
 
