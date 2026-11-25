@@ -126,13 +126,14 @@ def _server_utils(monkeypatch, tokens):
     return mod
 
 
-def _chat(monkeypatch, tokens, tools, stream=False, openai=False):
+def _chat(monkeypatch, tokens, tools, stream=False, openai=False, enable_thinking=False):
     """Run one /api/chat (or /v1/chat/completions) request through ChatEndpointHandler.
     Non-stream: the response body as a dict. Stream: the list of chunks (dicts for
     Ollama NDJSON lines, dicts of the `data:` payloads for OpenAI SSE)."""
     server_utils = _server_utils(monkeypatch, tokens)
     result = server_utils.ChatEndpointHandler.handle_request(
-        "qwen-test", [{"role": "user", "content": "q"}], stream=stream, tools=tools, is_openai_request=openai)
+        "qwen-test", [{"role": "user", "content": "q"}], stream=stream, tools=tools, is_openai_request=openai,
+        enable_thinking=enable_thinking)
     if not stream:
         response, code = result
         assert code == 200
@@ -686,3 +687,81 @@ def test_closed_call_followed_by_unclosed_tags_is_found(fu):
     answer = JSON_CALL + "\n<tool_call>" * 3
     calls, content, used_xml = fu.extract_tool_calls(answer, WEATHER_TOOLS)
     assert (calls, content, used_xml) == (PARIS_CALL, "<tool_call>\n<tool_call>\n<tool_call>", False)
+
+
+# --- thinking text in tool-call answers (#33) ------------------------------------------
+# The stream path keeps thinking text out of the call search (final_response_tokens); the
+# non-stream path searches and returns the whole text, thinking included.
+
+THINKING = "<think>\nThe user wants the weather in Paris.\n</think>\n\n"
+
+
+def test_xml_chat_complete_keeps_thinking_out_of_content(monkeypatch):
+    body = _chat(monkeypatch, [THINKING, "I will check.\n", XML_CALL], WEATHER_TOOLS, enable_thinking=True)
+
+    assert body["message"]["tool_calls"] == PARIS_CALL
+    content = body["message"]["content"]
+    assert "<think>" not in content and "The user wants" not in content, content
+
+
+@pytest.mark.parametrize("call", [JSON_CALL, XML_CALL], ids=["json", "xml"])
+def test_chat_complete_ignores_a_tool_call_inside_thinking(monkeypatch, call):
+    tokens = ["<think>\nI could call ", call, " but I know it.\n</think>\n\n", "It is sunny in Paris."]
+
+    body = _chat(monkeypatch, tokens, WEATHER_TOOLS, enable_thinking=True)
+    chunks = _chat(monkeypatch, tokens, WEATHER_TOOLS, stream=True, enable_thinking=True)
+
+    # the stream path already gives no call; the non-stream answer must agree with it
+    assert all("tool_calls" not in c["message"] for c in chunks) and chunks[-1]["done_reason"] == "stop"
+    assert "tool_calls" not in body["message"], body["message"]
+    assert body["done_reason"] == "stop"
+
+
+def _stream_result(chunks):
+    """(tool_calls, done_reason) of a streamed Ollama chat answer."""
+    calls = [c["message"]["tool_calls"] for c in chunks if "tool_calls" in c.get("message", {})]
+    return (calls[0] if calls else None), chunks[-1]["done_reason"]
+
+
+@pytest.mark.parametrize("call", [JSON_CALL, XML_CALL], ids=["json", "xml"])
+def test_call_after_thinking_gives_the_same_result_stream_and_non_stream(monkeypatch, call):
+    # </think> as its own token, as models send it (the stream path checks the first token
+    # only for <think>, so a first token holding the whole block would stay "thinking")
+    tokens = ["<think>\nThe user wants the weather in Paris.\n", "</think>", "\n\nI will check.\n", call]
+
+    body = _chat(monkeypatch, tokens, WEATHER_TOOLS, enable_thinking=True)
+    chunks = _chat(monkeypatch, tokens, WEATHER_TOOLS, stream=True, enable_thinking=True)
+
+    assert (body["message"]["tool_calls"], body["done_reason"]) == (PARIS_CALL, "tool_calls")
+    assert _stream_result(chunks) == (PARIS_CALL, "tool_calls")
+    assert "The user wants" not in body["message"]["content"]
+
+
+@pytest.mark.parametrize("call", [JSON_CALL, XML_CALL], ids=["json", "xml"])
+def test_thinking_without_end_tag_gives_no_call(monkeypatch, call):
+    # Thinking on and no </think>: the whole answer is thinking (the model ran out of tokens
+    # while thinking), so a call in it is not a call; the stream path already does this
+    tokens = ["<think>\nMaybe ", call, " later."]
+
+    body = _chat(monkeypatch, tokens, WEATHER_TOOLS, enable_thinking=True)
+    chunks = _chat(monkeypatch, tokens, WEATHER_TOOLS, stream=True, enable_thinking=True)
+
+    assert ("tool_calls" not in body["message"], body["done_reason"]) == (True, "stop")
+    assert _stream_result(chunks) == (None, "stop")
+
+
+def test_thinking_answer_without_a_call_keeps_its_content(monkeypatch):
+    # Out of scope for #33: an answer with tools but no call keeps the thinking in content
+    tokens = [THINKING, "It is sunny in Paris."]
+
+    body = _chat(monkeypatch, tokens, WEATHER_TOOLS, enable_thinking=True)
+
+    assert "tool_calls" not in body["message"]
+    assert body["message"]["content"] == THINKING + "It is sunny in Paris."
+
+
+def test_call_with_thinking_off_is_still_found_after_a_think_block(monkeypatch):
+    # Thinking off: the answer is searched as a whole, as before #33
+    body = _chat(monkeypatch, [THINKING, JSON_CALL], WEATHER_TOOLS)
+
+    assert (body["message"]["tool_calls"], body["done_reason"]) == (PARIS_CALL, "tool_calls")
