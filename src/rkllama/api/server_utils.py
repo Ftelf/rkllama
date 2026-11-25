@@ -561,6 +561,18 @@ class ChatEndpointHandler(EndpointHandler):
         return Response(generate(), content_type='application/x-ndjson')
     
 
+    @staticmethod
+    def text_after_thinking(text, enable_thinking):
+        """The part of an answer that tool calls are searched in. With thinking on, only the
+        text after the first </think>: a call the model drafts while thinking is not a call,
+        and the thinking must not end up in the content of a tool-call answer. With thinking
+        on and no </think>, the whole answer is thinking. Same rule as the stream path
+        (final_response_tokens)."""
+        if not enable_thinking:
+            return text
+        end = text.lower().find("</think>")
+        return text[end + len("</think>"):] if end >= 0 else ""
+
     @classmethod
     def handle_complete(cls, model_name, final_prompt, format_spec, tools, enable_thinking, images=None, prompt_cache_file = None, options = None):
         """Handle complete non-streaming chat response"""
@@ -645,7 +657,8 @@ class ChatEndpointHandler(EndpointHandler):
         tool_calls = None
         tool_call_content = ""
         if tools:
-            tool_calls, content_without_calls, used_xml = extract_tool_calls(complete_text, tools)
+            tool_calls, content_without_calls, used_xml = extract_tool_calls(
+                cls.text_after_thinking(complete_text, enable_thinking), tools)
             # The XML form (Qwen3.5) keeps the text around the parsed blocks; the JSON form keeps
             # today's empty content
             tool_call_content = content_without_calls if used_xml else ""
