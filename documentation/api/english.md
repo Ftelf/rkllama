@@ -389,6 +389,7 @@ When a model calls a tool, the response includes `tool_calls`:
 - **Format normalization** - automatically handles `parameters` vs `arguments`
 - **Robust JSON parsing** with fallback methods
 - **Multiple tool calls** in a single response
+- **Thinking-aware** - with thinking on, calls are searched only after `</think>`; a call drafted while thinking is not a call
 
 For complete documentation, see the [Tool Calling Guide](./tools.md).
 

@@ -237,6 +237,14 @@ RKLLama uses a multi-stage detection system:
 2. **Generic JSON Extraction**: When no block gives a call, parses any JSON with `name` + `arguments`/`parameters` in the whole answer (skipped when the answer holds an XML block, so a parameter value that looks like JSON is never taken for a call)
 3. **Format Normalization**: Converts `parameters` to `arguments` for consistency
 
+### Tool Calls with Thinking
+
+With thinking on (`think` / `enable_thinking` in the request, or `ENABLE_THINKING` in the Modelfile), calls are searched only in the text after the first `</think>`, streamed or not:
+
+- A call the model only drafts inside `<think>` is not a call: no `tool_calls`, `done_reason: "stop"`.
+- An answer that ends without `</think>` (e.g. cut by the token limit while thinking) has no calls.
+- A tool-call answer has no thinking text in `content`. An answer without a call keeps it, as before.
+
 ## Complete Examples
 
 ### Example 1: Weather Tool
