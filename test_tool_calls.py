@@ -15,7 +15,9 @@ not move any of it.
 import importlib.util
 import json
 import logging
+import re
 import sys
+import time
 import types
 
 import pytest
@@ -622,3 +624,65 @@ def test_openai_stream_arguments_are_json_for_any_value(fu, arguments):
 
 def test_openai_stream_arguments_already_a_string_pass_through(fu):
     assert _openai_stream_arguments(fu, '{"text": "it\'s"}') == '{"text": "it\'s"}'
+
+
+# --- scan cost --------------------------------------------------------------------------
+
+def test_unclosed_tool_call_tags_are_scanned_in_linear_time(fu):
+    """A runaway answer full of <tool_call> tags without </tool_call> must not stall the
+    request thread. Each unclosed tag makes `<tool_call>(.*?)</tool_call>` scan to the end
+    of the text, so the scan is quadratic: about 3.5 s CPU for 10 000 tags (110 000 chars)
+    on a laptop, 4x per doubling; a linear scan takes milliseconds.
+
+    A time bound, because there is no implementation-neutral counter of scan work. CPU
+    time (not wall time) keeps scheduler noise out. Margins on a laptop: the quadratic scan
+    (before #32) took about 3.4 s, 14x above the bound; the linear scan takes about 0.01 ms,
+    far below it. A slower board widens both margins. The block boundaries themselves are
+    pinned by test_block_scan_finds_the_same_blocks_as_the_lazy_regex."""
+    answer = "<tool_call>" * 10_000
+
+    start = time.process_time()
+    calls, content, used_xml = fu.extract_tool_calls(answer, WEATHER_TOOLS)
+    elapsed = time.process_time() - start
+
+    assert (calls, content, used_xml) == ([], answer, False)   # behaviour must not change
+    assert elapsed < 0.25, f"scanning {len(answer)} chars took {elapsed:.2f} s CPU"
+
+
+# --- block boundaries -------------------------------------------------------------------
+
+_REFERENCE_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)   # the scan before #32
+
+
+@pytest.mark.parametrize("text", [
+    "",
+    "no tags at all",
+    "<tool_call></tool_call>",
+    "<tool_call>x</tool_call>",
+    "a<tool_call>x</tool_call>b<tool_call>y</tool_call>c",
+    "<tool_call>\nmulti\nline\n</tool_call>",
+    "<tool_call>a<tool_call>b</tool_call>",                  # unclosed tag, then a closed one
+    "<tool_call><tool_call></tool_call></tool_call>",
+    "<tool_call>x</tool_call><tool_call>",                   # closed block, then an unclosed tag
+    "<tool_call>x</tool_call>" + "<tool_call>" * 3,
+    "</tool_call><tool_call>x</tool_call>",                  # stray closing tag first
+    "<tool_call>x</tool_call></tool_call>",
+    "<tool_call>" * 3,
+    "<tool_call" + "x</tool_call>",                          # broken opening tag
+])
+def test_block_scan_finds_the_same_blocks_as_the_lazy_regex(fu, text):
+    expected = [(m.start(), m.end(), m.group(1)) for m in _REFERENCE_BLOCK_RE.finditer(text)]
+    assert list(fu._tool_call_blocks(text)) == expected
+
+
+def test_closed_call_after_an_unclosed_tag_is_found(fu):
+    # The unclosed tag opens the block, so its text is part of the block and leaves with the call
+    answer = "Let me check. <tool_call>oops " + JSON_CALL + " Done."
+    calls, content, used_xml = fu.extract_tool_calls(answer, WEATHER_TOOLS)
+    assert (calls, content, used_xml) == (PARIS_CALL, "Let me check.  Done.", False)
+
+
+def test_closed_call_followed_by_unclosed_tags_is_found(fu):
+    answer = JSON_CALL + "\n<tool_call>" * 3
+    calls, content, used_xml = fu.extract_tool_calls(answer, WEATHER_TOOLS)
+    assert (calls, content, used_xml) == (PARIS_CALL, "<tool_call>\n<tool_call>\n<tool_call>", False)
