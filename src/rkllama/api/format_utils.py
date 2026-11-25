@@ -1165,7 +1165,8 @@ def get_tool_calls_generic(response):
     return tool_calls_renamed
 
 
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_TOOL_CALL_OPEN = "<tool_call>"
+_TOOL_CALL_CLOSE = "</tool_call>"
 _XML_BLOCK_START_RE = re.compile(r"\s*<function=")
 _XML_TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=")
 _XML_FUNCTION_OPEN = "<function="
@@ -1366,6 +1367,27 @@ def parse_xml_tool_call(inner, tools=None):
     return call
 
 
+def _tool_call_blocks(text):
+    """Yield (start, end, inner) for each <tool_call>...</tool_call> block, in text order.
+
+    Same blocks as re.finditer(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL), in linear
+    time: that regex rescans to the end of the text from every unclosed <tool_call>, which is
+    quadratic for an answer full of unclosed tags. When a tag has no </tool_call> after it,
+    no later tag has one either, so the scan stops there."""
+    pos = 0
+    while True:
+        start = text.find(_TOOL_CALL_OPEN, pos)
+        if start < 0:
+            return
+        inner_start = start + len(_TOOL_CALL_OPEN)
+        close = text.find(_TOOL_CALL_CLOSE, inner_start)
+        if close < 0:
+            return
+        end = close + len(_TOOL_CALL_CLOSE)
+        yield start, end, text[inner_start:close]
+        pos = end
+
+
 def extract_tool_calls(response, tools=None):
     """Find the tool calls in a model answer.
 
@@ -1383,8 +1405,7 @@ def extract_tool_calls(response, tools=None):
     used_xml = False
     kept_text = []
     last_end = 0
-    for block in _TOOL_CALL_BLOCK_RE.finditer(response):
-        inner = block.group(1)
+    for block_start, block_end, inner in _tool_call_blocks(response):
         if _XML_BLOCK_START_RE.match(inner):
             call = parse_xml_tool_call(inner, tools)
             block_calls = [call] if call else []
@@ -1395,8 +1416,8 @@ def extract_tool_calls(response, tools=None):
             block_calls = get_tool_calls_generic(inner)
         if block_calls:
             tool_calls += block_calls
-            kept_text.append(response[last_end:block.start()])
-            last_end = block.end()
+            kept_text.append(response[last_end:block_start])
+            last_end = block_end
     kept_text.append(response[last_end:])
 
     if not tool_calls and not _XML_TOOL_CALL_RE.search(response):
