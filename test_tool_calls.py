@@ -93,7 +93,7 @@ class FakeManager:
     def __init__(self, tokens):
         self.tokens = tokens
 
-    def load_and_begin_request(self, model_name, options=None):
+    def load_and_begin_request(self, model_name, options=None, request_id=None):
         return None
 
     def end_request(self, model_name):
@@ -105,7 +105,7 @@ class FakeManager:
     def update_expiration_date_for_model(self, model_name):
         pass
 
-    def inference(self, model_name, prompt, prompt_cache_file, options):
+    def inference(self, model_name, prompt, prompt_cache_file, options, request_id=None):
         return FakePipe(self.tokens)
 
 
