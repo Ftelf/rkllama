@@ -184,7 +184,7 @@ def test_add_worker_evicts_least_recently_used_model_until_ram_fits(env, monkeyp
 
     evicted = []
 
-    def fake_stop_worker(model_name, timeout=30):
+    def fake_stop_worker(model_name, timeout=30, reason=None):
         evicted.append(model_name)
         fake_vm.available += env.manager.workers.pop(model_name).worker_model_info.size
 
