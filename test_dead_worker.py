@@ -68,9 +68,9 @@ def _kill(process):
 
 
 def _real_worker(name, process):
-    """A worker entry with a real process, a real task queue and a real abort flag."""
+    """A worker entry with a real process and a real task queue."""
     return types.SimpleNamespace(
-        process=process, task_queue=SPAWN.Queue(), abort_flag=SPAWN.Value('b', False),
+        process=process, task_queue=SPAWN.Queue(),
         pipe_closed_without_result=False,
         worker_model_info=types.SimpleNamespace(model=name, last_call=None, expires_at=None))
 
@@ -116,7 +116,7 @@ class _FakeQueue:
 
 def _fake_worker(name, process, domain=1):
     return types.SimpleNamespace(
-        process=process, task_queue=_FakeQueue(), abort_flag=types.SimpleNamespace(value=False),
+        process=process, task_queue=_FakeQueue(),
         pipe_closed_without_result=False,
         worker_model_info=types.SimpleNamespace(model=name, size=0, base_domain_id=[domain],
                                                 last_call=None, expires_at=None))
@@ -647,7 +647,7 @@ def test_reaping_a_dead_worker_wakes_a_load_waiting_for_its_domain(env, monkeypa
 # --- abort and bookkeeping after the model was unloaded ----------------------------
 
 @pytest.mark.parametrize("unload", ["removed", "replaced"])
-def test_abort_after_unload_sets_the_original_workers_flag(env, unload):
+def test_abort_after_unload_reaches_the_task_of_the_request(env, unload):
     original = _live_fake_worker("m")
     env.manager.workers["m"] = original
     conn = env.manager._send_tracked_task("m", ("TASK",))
@@ -662,8 +662,11 @@ def test_abort_after_unload_sets_the_original_workers_flag(env, unload):
     finally:
         conn.close()
 
-    assert original.abort_flag.value is True, "the abort did not reach the worker the request was sent to"
-    assert replacement.abort_flag.value is False, "the abort hit another worker"
+    # The abort travels on the request's own pipe (issue #37): the worker the task went to reads it there
+    task_conn = original.task_queue.items[0][0]
+    assert task_conn.poll(1), "the abort did not reach the task of the request"
+    assert task_conn.recv() == env.worker_mod.WORKER_TASK_ABORT_REQUEST
+    assert replacement.task_queue.items == [], "the abort reached another worker"
 
 
 def test_update_expiration_of_an_unloaded_model_is_a_noop(env):

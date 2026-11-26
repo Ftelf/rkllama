@@ -134,7 +134,7 @@ def env(monkeypatch):
     runtime = _Runtime()
     monkeypatch.setattr(sys.modules["rkllama.api.rkllm"], "RKLLM", _fake_rkllm_class(runtime, callback))
     env = types.SimpleNamespace(worker_mod=worker_mod, runtime=runtime, tasks=queue.Queue(),
-                                abort_flag=multiprocessing.Value("b", False), worker_thread=None)
+                                worker_thread=None)
     yield env
     # A run the worker left behind must not outlive the test
     for instance in runtime.instances:
@@ -160,7 +160,7 @@ def _start_worker(env):
     env.tasks.put((None, env.worker_mod.WORKER_TASK_UNLOAD_MODEL, None, None, None, None))
     env.worker_thread = threading.Thread(
         target=env.worker_mod.run_rkllm_worker,
-        args=("fake-model", env.tasks, queue.Queue(), env.abort_flag),
+        args=("fake-model", env.tasks, queue.Queue()),
         kwargs={"model_path": "unused", "model_dir": "unused"}, daemon=True)
     env.worker_thread.start()
 
@@ -244,25 +244,24 @@ def test_clear_cache_never_runs_during_a_run(env):
     assert calls == [0, 0, 0], f"clear_cache ran during a run: active runs per call {calls}"
 
 
-def test_abort_flag_path_waits_for_the_run_to_end(env):
+def test_abort_path_waits_for_the_run_to_end(env):
     first = _inference(env, LONG_RUN, "a")
     live = _inference(env, SHORT_RUN, "b")
     _start_worker(env)
     # A reader that gives up on the answer but still reads the outcome
     assert _recv(first) == "a0,"
-    env.abort_flag.value = True
+    first.send(env.worker_mod.WORKER_TASK_ABORT_REQUEST)
     first_answer = _read_answer(env, first)
     second_answer = _read_answer(env, live)
     env.worker_thread.join(READ_TIMEOUT)
 
-    # What the abort-flag path reports is unchanged: FINISHED with zero stats
+    # What the abort path reports is unchanged: FINISHED with zero stats
     assert first_answer[-1] == (env.worker_mod.WORKER_TASK_FINISHED, 0, 0, 0, 0), first_answer
     _assert_complete_answer(env, second_answer, "b", SHORT_RUN)
     runtime = env.runtime
     assert runtime.abort_calls == [1], runtime.abort_calls
     assert runtime.max_active == 1, f"{runtime.max_active} runs at once on one runtime handle"
     assert runtime.clear_cache_calls == [0, 0, 0], f"clear_cache ran during a run: {runtime.clear_cache_calls}"
-    assert not env.abort_flag.value, "the abort flag stayed set for the next request"
 
 
 class _ConnFailingOnSecondSend:
@@ -278,6 +277,12 @@ class _ConnFailingOnSecondSend:
         if self.sends == 2:
             raise RuntimeError("unexpected failure while sending a token")
         self._conn.send(value)
+
+    def poll(self, timeout=0.0):
+        return self._conn.poll(timeout)
+
+    def recv(self):
+        return self._conn.recv()
 
     def close(self):
         self._conn.close()
@@ -323,13 +328,22 @@ def test_finished_requests_are_not_stopped(env):
 def test_client_gone_at_the_final_drain_stops_without_aborting_an_ended_run(env, caplog, monkeypatch):
     """The run has ended when the worker first finds the pipe closed (the final
     drain): the stop sequence must still run, but without abort() on the idle handle."""
-    fake_threading = types.SimpleNamespace(**{n: getattr(threading, n) for n in dir(threading) if not n.startswith("__")})
-    fake_threading.Thread = _RunInsideJoinThread  # the whole run happens inside the worker's join()
-    monkeypatch.setattr(env.worker_mod, "threading", fake_threading)
-    caplog.set_level(logging.INFO, logger="rkllama.worker")
     dropped = _inference(env, SHORT_RUN, "a")
     live = _inference(env, SHORT_RUN, "b")
-    dropped.close()  # gone before the worker sends anything: every token goes out in the final drain
+
+    class _ClientLeavesDuringTheRun(_RunInsideJoinThread):
+        """The client closes its end while the run is going on (a task whose client is
+        gone before it starts is skipped, issue #37): every token goes out in the final drain."""
+
+        def join(self, timeout=None):
+            if not dropped.closed:
+                dropped.close()
+            super().join(timeout)
+
+    fake_threading = types.SimpleNamespace(**{n: getattr(threading, n) for n in dir(threading) if not n.startswith("__")})
+    fake_threading.Thread = _ClientLeavesDuringTheRun  # the whole run happens inside the worker's join()
+    monkeypatch.setattr(env.worker_mod, "threading", fake_threading)
+    caplog.set_level(logging.INFO, logger="rkllama.worker")
     _start_worker(env)
     second_answer = _read_answer(env, live)
     env.worker_thread.join(READ_TIMEOUT)
@@ -345,13 +359,13 @@ def test_client_gone_at_the_final_drain_stops_without_aborting_an_ended_run(env,
     assert problems == [], problems
 
 
-def test_a_failing_stop_sequence_does_not_leave_the_abort_flag_set(env, caplog):
+def test_a_failing_stop_sequence_does_not_break_the_next_request(env, caplog):
     env.runtime.clear_cache_failures = 1  # the stop sequence's clear_cache raises
     first = _inference(env, LONG_RUN, "a")
     live = _inference(env, SHORT_RUN, "b")
     _start_worker(env)
     assert _recv(first) == "a0,"
-    env.abort_flag.value = True
+    first.send(env.worker_mod.WORKER_TASK_ABORT_REQUEST)
     first_answer = _read_answer(env, first)
     second_answer = _read_answer(env, live)
     env.worker_thread.join(READ_TIMEOUT)
@@ -360,7 +374,6 @@ def test_a_failing_stop_sequence_does_not_leave_the_abort_flag_set(env, caplog):
     assert first_answer[-1] == env.worker_mod.WORKER_TASK_ERROR, first_answer
     assert any("Failed executing task" in r.getMessage() for r in caplog.records if r.name == "rkllama.worker")
     _assert_complete_answer(env, second_answer, "b", SHORT_RUN)
-    assert not env.abort_flag.value, "the abort flag stayed set for the next request"
     assert env.runtime.max_active == 1, env.runtime.max_active
 
 
@@ -438,7 +451,7 @@ def test_partial_utf8_bytes_of_a_run_do_not_empty_the_next_answer(env, monkeypat
     if aborted:
         first_answer.append(_recv(first))
         assert partial_sent.wait(READ_TIMEOUT)
-        env.abort_flag.value = True
+        first.send(env.worker_mod.WORKER_TASK_ABORT_REQUEST)
     first_answer += _read_answer(env, first)
     second_answer = _read_answer(env, live)
     env.worker_thread.join(READ_TIMEOUT)

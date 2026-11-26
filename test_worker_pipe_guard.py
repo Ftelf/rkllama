@@ -156,8 +156,6 @@ def _run_one_timed_out_task(worker_mod, run_duration):
     """
     task_queue = multiprocessing.Queue()
     result_queue = multiprocessing.Queue()
-    abort_flag = multiprocessing.Value("b", False)
-
     parent_conn, child_conn = multiprocessing.Pipe()
     task_queue.put((
         child_conn,
@@ -176,17 +174,18 @@ def _run_one_timed_out_task(worker_mod, run_duration):
 
     # Simulate the API-layer client: poll with a timeout shorter than the
     # model's run_duration, then behave exactly like ChatEndpointHandler's
-    # timeout branch (set the abort flag, close its own end of the pipe).
+    # timeout branch (TrackedConnection.request_abort sends the abort on the
+    # request's own pipe, then the reader closes its end).
     def client():
         if not parent_conn.poll(0.05):
-            abort_flag.value = True
+            parent_conn.send(worker_mod.WORKER_TASK_ABORT_REQUEST)
             parent_conn.close()
 
     client_thread = threading.Thread(target=client)
     client_thread.start()
 
     worker_mod.run_rkllm_worker(
-        "fake-model", task_queue, result_queue, abort_flag,
+        "fake-model", task_queue, result_queue,
         model_path="unused", model_dir="unused",
     )
     client_thread.join(timeout=5)
@@ -215,7 +214,6 @@ def test_worker_still_delivers_result_on_the_happy_path():
 
     task_queue = multiprocessing.Queue()
     result_queue = multiprocessing.Queue()
-    abort_flag = multiprocessing.Value("b", False)
 
     parent_conn, child_conn = multiprocessing.Pipe()
     task_queue.put((
@@ -232,7 +230,7 @@ def test_worker_still_delivers_result_on_the_happy_path():
 
     worker_thread = threading.Thread(
         target=worker_mod.run_rkllm_worker,
-        args=("fake-model", task_queue, result_queue, abort_flag),
+        args=("fake-model", task_queue, result_queue),
         kwargs={"model_path": "unused", "model_dir": "unused"},
     )
     worker_thread.start()

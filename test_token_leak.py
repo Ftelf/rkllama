@@ -74,7 +74,7 @@ def _run_inferences(worker_mod, n_requests):
         task_queue.put((child, worker_mod.WORKER_TASK_INFERENCE, "m", "t", ([1, 2, 3], None), {}))
     _, unload_child = multiprocessing.Pipe()
     task_queue.put((unload_child, worker_mod.WORKER_TASK_UNLOAD_MODEL, None, None, None, None))
-    worker_mod.run_rkllm_worker("fake-model", task_queue, multiprocessing.Queue(), multiprocessing.Value("b", False),
+    worker_mod.run_rkllm_worker("fake-model", task_queue, multiprocessing.Queue(),
                                 model_path="unused", model_dir="unused")
 
     texts = []

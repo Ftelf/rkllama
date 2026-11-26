@@ -15,6 +15,7 @@ ctypes runtime).
 import importlib.util
 import multiprocessing
 import sys
+import time
 import types
 
 import pytest
@@ -29,14 +30,13 @@ def _fresh_worker_module():
 
 # --- the worker reports why an inference produced no result -------------------------
 
-def _run_one_inference(worker_mod, task_queue_items, abort_flag=None):
+def _run_one_inference(worker_mod, task_queue_items):
     task_queue = multiprocessing.Queue()
-    abort_flag = abort_flag or multiprocessing.Value("b", False)
     for item in task_queue_items:
         task_queue.put(item)
     _, unload_child = multiprocessing.Pipe()
     task_queue.put((unload_child, worker_mod.WORKER_TASK_UNLOAD_MODEL, None, None, None, None))
-    worker_mod.run_rkllm_worker("fake-model", task_queue, multiprocessing.Queue(), abort_flag,
+    worker_mod.run_rkllm_worker("fake-model", task_queue, multiprocessing.Queue(),
                                 model_path="unused", model_dir="unused")
 
 
@@ -78,20 +78,19 @@ def test_aborted_inference_still_reports_finished_not_error(monkeypatch):
     reporting a normal finish with zero stats, not the new 'no result' error."""
     FakeRKLLM, worker_mod = _fresh_worker_module()
     sys.modules["rkllama.api.callback"].global_metrics.clear()
-    abort_flag = multiprocessing.Value("b", False)
+    parent, child = multiprocessing.Pipe()
 
     def aborted_run(self, *args):
-        abort_flag.value = True  # client timed out / disconnected mid-inference
+        # The client times out mid-inference: its reader sends the abort on its own pipe
+        parent.send(worker_mod.WORKER_TASK_ABORT_REQUEST)
+        time.sleep(0.2)
 
     monkeypatch.setattr(FakeRKLLM, "run", aborted_run)
 
-    parent, child = multiprocessing.Pipe()
-    _run_one_inference(worker_mod, [(child, worker_mod.WORKER_TASK_INFERENCE, "m", "t", ([1], None), {})],
-                       abort_flag=abort_flag)
+    _run_one_inference(worker_mod, [(child, worker_mod.WORKER_TASK_INFERENCE, "m", "t", ([1], None), {})])
 
     assert parent.poll(2), "worker sent nothing back"
     assert parent.recv() == (worker_mod.WORKER_TASK_FINISHED, 0, 0, 0, 0)
-    assert abort_flag.value == 0, "abort flag not reset for the next request"
 
 
 def test_worker_error_message_keeps_plain_sentinel_and_ignores_finish_tuple():
