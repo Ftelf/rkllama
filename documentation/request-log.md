@@ -16,7 +16,7 @@ Only categories, numbers and the model name are logged. Prompt text, answer text
 | `finished` | the worker finished the answer |
 | `token limit` | the answer was cut by `max_new_tokens`. The worker reports no finish reason, and on RK3588 (rkllm 1.3.x) the runtime counts one token less than the limit at a cut (limits 6, 8, 12, 16 gave 5, 7, 11, 15), so this is `tokens >= max_new_tokens - 1`; a model that ends by itself on exactly that count looks the same |
 | `client gone` | the client closed a streamed answer. Only streams can show it: a non-stream request writes nothing until it is done. `tokens` is what was read so far |
-| `aborted` | the worker cut the run (abort flag) and reported empty stats; the abort did not come from this request's own timeout |
+| `aborted` | the worker reported empty stats although this request did not time out. A request's timeout aborts only its own run (issue #37), so this is not expected; an unverified possible cause is a run that reports all-zero stats by itself (e.g. a prompt-cache hit) |
 | `timed out` | no worker message within `max_seconds_waiting_worker_response` |
 | `worker dead` | the worker process exited or closed the pipe without a result |
 | `error` | anything else: the worker reported an error, the model could not be loaded (HTTP 500/503), the prompt was longer than the context (HTTP 400), an exception in the handler |
@@ -40,6 +40,8 @@ request 3fa9c21e end outcome=client gone duration_ms=2210 tokens=12
 ```
 
 A worker handles one task at a time, so every worker line between `run started` and `run ended` of an id belongs to that request. If the worker dies, the request also logs `request <id> worker exited exitcode=<n>`.
+
+A request that timed out (or whose client left) while its task was still queued is not run: the worker logs `request <id> run skipped outcome=aborted` (or `outcome=client gone`) instead of `run started` / `run ended`. The worker's `run ended outcome=aborted` means the request's own reader aborted it on a timeout; the request's end line then says `timed out`.
 
 ## Model lifecycle
 

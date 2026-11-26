@@ -27,7 +27,7 @@ logger = logging.getLogger("rkllama.request")
 FINISHED = "finished"
 TOKEN_LIMIT = "token limit"      # the answer was cut by max_new_tokens
 CLIENT_GONE = "client gone"      # the client closed a streamed answer; only streams can see it
-ABORTED = "aborted"              # the worker cut the run (abort flag) without this request asking for it
+ABORTED = "aborted"              # the worker reported empty stats although this request did not time out
 TIMED_OUT = "timed out"          # no worker answer within max_seconds_waiting_worker_response
 WORKER_DEAD = "worker dead"      # the worker process exited or closed the pipe without a result
 ERROR = "error"                  # anything else that failed
@@ -59,8 +59,10 @@ def hit_token_limit(options, token_count):
 def outcome_of_final_stats(options, prompt_token_count, token_count, prompt_eval, eval_time):
     """The outcome for the final message of a run that was not reported as an error.
 
-    A worker that aborted a run (abort flag) sends all-zero stats (run_rkllm_worker);
-    a run that produced a result never has a prompt of 0 tokens."""
+    A worker that aborted a run sends all-zero stats (run_rkllm_worker). Only the
+    request's own reader can abort it (issue #37), and that reader ends as TIMED_OUT,
+    so a reader that sees all-zero stats did not expect them; a run that produced a
+    result never has a prompt of 0 tokens."""
     if not any((prompt_token_count, token_count, prompt_eval, eval_time)):
         return ABORTED
     if hit_token_limit(options, token_count):
