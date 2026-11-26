@@ -227,7 +227,7 @@ class _ListQueue:
 def _loaded(env, name, domain, minutes_ago):
     """Register an already loaded worker that the real stop_worker can unload."""
     env.manager.workers[name] = types.SimpleNamespace(
-        process=None, task_queue=_ListQueue(), abort_flag=types.SimpleNamespace(value=False),
+        process=None, task_queue=_ListQueue(),
         worker_model_info=types.SimpleNamespace(
             model=name, size=0, base_domain_id=[domain],
             last_call=datetime.now() - timedelta(minutes=minutes_ago),

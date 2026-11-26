@@ -13,7 +13,7 @@ import ctypes
 import atexit
 import subprocess
 import configparser
-from multiprocessing import Process, Queue, Value, Pipe, parent_process
+from multiprocessing import Process, Queue, Pipe, parent_process
 from multiprocessing.connection import wait
 
 
@@ -103,6 +103,9 @@ WORKER_TASK_VISION_ENCODER = "VISION_ENCODER"
 WORKER_TASK_FINISHED = "<RKLLM_TASK_FINISHED>"
 WORKER_TASK_ERROR = "<RKLLM_TASK_ERROR>"
 WORKER_TASK_ABORT_INFERENCE = "ABORT"
+# Sent by a request's reader on its own request pipe (TrackedConnection.request_abort): abort
+# the task of this request and of no other (issue #37)
+WORKER_TASK_ABORT_REQUEST = "ABORT_REQUEST"
 WORKER_TASK_CLEAR_CACHE = "CLEAR_CACHE"
 WORKER_TASK_GENERATE_IMAGE = "GENERATE_IMAGE"
 WORKER_TASK_GENERATE_SPEECH = "GENERATE_SPEECH"
@@ -157,7 +160,48 @@ def _send_to_client(conn, value, name):
         return False
 
 
-def _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name):
+# What _requester_signal finds on a request pipe
+REQUESTER_ABORTED = "aborted"
+REQUESTER_GONE = "gone"
+
+
+def _requester_signal(conn):
+    """What the reader of this task signalled on its request pipe, without blocking:
+    REQUESTER_ABORTED (it sent WORKER_TASK_ABORT_REQUEST), REQUESTER_GONE (its end is
+    closed) or None. The abort travels on the request's own pipe, so it reaches only
+    this request's task, whether that task is running or still queued (issue #37).
+
+    EOF is only a hint: a worker forked while this request was open holds a copy of the
+    reader's end, so a closed reader does not always show as EOF. A reader that wants
+    its run stopped sends the abort message first."""
+    if conn is None:
+        return None
+    try:
+        if not conn.poll(0):
+            return None
+        message = conn.recv()
+    except (EOFError, OSError):
+        return REQUESTER_GONE
+    if message == WORKER_TASK_ABORT_REQUEST:
+        return REQUESTER_ABORTED
+    # A reader sends nothing else on its request pipe
+    logger.warning("Ignoring an unexpected message from the reader of a task")
+    return None
+
+
+def _skip_task(conn, request_id, requester_signal, name, final_message=None):
+    """Do not run a task whose reader aborted it or left while it was still queued: the
+    run would only make the requests behind it wait (issue #37). ``final_message`` is
+    what an aborted run of this task type would report."""
+    outcome = "aborted" if requester_signal == REQUESTER_ABORTED else "client gone"
+    logger.info(f"Skipping a queued task of model {name}: its request was {outcome} before the task started")
+    if requester_signal == REQUESTER_ABORTED and final_message is not None:
+        _safe_send(conn, final_message, f"skipped task result for model {name}")
+    conn.close()
+    _log_request(request_id, f"run skipped outcome={outcome}", name)
+
+
+def _stop_rkllm_run(model_rkllm, thread_model, name):
     """Stop the run of ``thread_model`` and wait until it has ended, so the next
     task (CLEAR_CACHE, the next INFERENCE) never uses the runtime handle while a
     run still does (issue #24).
@@ -169,23 +213,17 @@ def _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name):
     (#23) does not see it (no EOF, the process is alive).
     """
     started = time.monotonic()
-    try:
-        # Only a running run is aborted: what rkllm_abort does to an idle handle is unknown
-        aborted = thread_model.is_alive()
-        if aborted:
-            logger.info(f"Aborting inference for model {name}...")
-            model_rkllm.abort()
-        thread_model.join()
-        joined = time.monotonic()
-        model_rkllm.clear_cache()
-        # Evidence of how long rkllm_abort takes to end a run on the board
-        logger.info(f"Run of model {name} stopped after {(time.monotonic() - started) * 1000:.0f} ms "
-                    f"(aborted={aborted}, abort+join {(joined - started) * 1000:.0f} ms)")
-    finally:
-        # A reader that timed out sets the flag and closes its pipe; whichever the
-        # worker noticed first, the flag belonged to this run and must not abort the
-        # next one, also when abort() or clear_cache() raised
-        abort_flag.value = False
+    # Only a running run is aborted: what rkllm_abort does to an idle handle is unknown
+    aborted = thread_model.is_alive()
+    if aborted:
+        logger.info(f"Aborting inference for model {name}...")
+        model_rkllm.abort()
+    thread_model.join()
+    joined = time.monotonic()
+    model_rkllm.clear_cache()
+    # Evidence of how long rkllm_abort takes to end a run on the board
+    logger.info(f"Run of model {name} stopped after {(time.monotonic() - started) * 1000:.0f} ms "
+                f"(aborted={aborted}, abort+join {(joined - started) * 1000:.0f} ms)")
 
 
 def worker_error_message(message):
@@ -321,7 +359,7 @@ def run_translation_generator(model_runtime, model_input):
     
 
 # RKLLM Worker 
-def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, model_dir, options=None, lora_model_path = None, prompt_cache_path = None, base_domain_id = 0):
+def run_rkllm_worker(name, task_queue, result_queue, model_path, model_dir, options=None, lora_model_path = None, prompt_cache_path = None, base_domain_id = 0):
     _reset_inherited_signal_handlers()
 
     # Die with the parent to prevent NPU memory leaks on parent crash
@@ -385,6 +423,11 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                 model_rkllm.clear_cache()
 
             elif task == WORKER_TASK_INFERENCE:
+                requester_signal = _requester_signal(child_conn)
+                if requester_signal is not None:
+                    _skip_task(child_conn, request_id, requester_signal, name,
+                               final_message=(WORKER_TASK_FINISHED, 0, 0, 0, 0))
+                    continue
                 logger.info(f"Running inference for model {name}...")
                 _log_request(request_id, "run started task=inference", name)
                 run_open = True
@@ -405,12 +448,19 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                 thread_finished = False
                 # The requesting client closed its end: nobody reads this answer any more
                 client_gone = False
+                # The reader of this request asked to abort it (its own timeout)
+                aborted_run = False
                 while not thread_finished:
 
-                    # Check for abort of inference
-                    if abort_flag.value:
-                        # Exit the current loop
-                        break 
+                    # Only this request's reader can abort this run (issue #37)
+                    requester_signal = _requester_signal(child_conn)
+                    if requester_signal == REQUESTER_ABORTED:
+                        aborted_run = True
+                        break
+                    if requester_signal == REQUESTER_GONE:
+                        logger.info(f"The client of model {name} disconnected during the answer (its end of the request pipe is closed): stopping the run")
+                        client_gone = True
+                        break
 
                     tokens_processed = False
                     while len(global_text) > 0:
@@ -432,7 +482,7 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
                 # The model thread can append its last token between the drain above and join(): drain once
                 # more, or that token is lost for this answer and stays in global_text for the next request
-                if not abort_flag.value and not client_gone:
+                if not aborted_run and not client_gone:
                     while len(global_text) > 0:
                         if not _send_to_client(child_conn, global_text.pop(0), name):
                             client_gone = True
@@ -442,17 +492,15 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                     # The run must end before the next task (the CLEAR_CACHE queued after every
                     # inference, the next INFERENCE) uses the runtime handle. Nothing is reported:
                     # the client's end is closed
-                    _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name)
+                    _stop_rkllm_run(model_rkllm, thread_model, name)
                     child_conn.close()
                     _log_request(request_id, "run ended outcome=client gone", name)
                     run_open = False
                     continue
 
-                # Check for abort of inference
-                aborted_run = bool(abort_flag.value)
-                if abort_flag.value:
-                    # Abort the current inference of the model, wait until it has ended, reset the flag
-                    _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name)
+                if aborted_run:
+                    # Abort the current inference of the model and wait until it has ended
+                    _stop_rkllm_run(model_rkllm, thread_model, name)
                     # Empty stats
                     prompt_token_count=0
                     token_count=0
@@ -487,6 +535,10 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
         
                 
             elif task == WORKER_TASK_EMBEDDING:
+                requester_signal = _requester_signal(child_conn)
+                if requester_signal is not None:
+                    _skip_task(child_conn, request_id, requester_signal, name)
+                    continue
                 logger.info(f"Running embedding for model {name}...")
                 _log_request(request_id, "run started task=embedding", name)
                 run_open = True
@@ -534,7 +586,7 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                 _log_request(request_id, "run ended outcome=error", name)
             # Whatever failed, the run of this task must not go on while the worker takes the next task
             if thread_model is not None and thread_model.is_alive():
-                _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name)
+                _stop_rkllm_run(model_rkllm, thread_model, name)
             _safe_send(child_conn, WORKER_TASK_ERROR, f"error report for model {name}")
 
             # Close the connection
@@ -884,9 +936,15 @@ class TrackedConnection:
             raise
 
     def request_abort(self):
-        """Ask the worker this request went to to abort it (no lookup by model
-        name: the model may have been unloaded or replaced meanwhile)."""
-        self._worker.abort_flag.value = True
+        """Ask the worker to abort the task of this request and of no other: the
+        message goes on this request's own pipe (issue #37), so it reaches the
+        worker the task went to even if the model was unloaded or replaced
+        meanwhile. A task that is still queued is skipped when its turn comes."""
+        try:
+            self._conn.send(WORKER_TASK_ABORT_REQUEST)
+        except (BrokenPipeError, OSError) as e:
+            # The worker's end is gone: there is no run of this request left to abort
+            logger.debug(f"Could not send the abort of request {self.request_id}: {e}")
 
     def _release_once(self):
         release, self._release = self._release, None
@@ -2051,7 +2109,6 @@ class Worker:
         self.worker_model_info = WorkerModelInfo(model_name=model_name, base_domain_id=base_domain_id, loaded_by=loaded_by)
         self.process = None
         self.task_queue = Queue()
-        self.abort_flag = Value('b', False)
         # Set by a request reader that saw this worker's end of the request pipe close without
         # a result: the worker is dead or dying, even while its process cannot be reaped yet
         self.pipe_closed_without_result = False
@@ -2103,7 +2160,7 @@ class Worker:
             if is_rkllm_model(self.worker_model_info.model): 
                 self.worker_model_info.num_ctx = context_length_from_options(options)
                 # RKLLM
-                self.process = Process(target=run_rkllm_worker, args=(self.worker_model_info.model, self.task_queue, result_queue, self.abort_flag, model_path, model_dir, options, lora_model_path, prompt_cache_path, base_domain_ids[0]))
+                self.process = Process(target=run_rkllm_worker, args=(self.worker_model_info.model, self.task_queue, result_queue, model_path, model_dir, options, lora_model_path, prompt_cache_path, base_domain_ids[0]))
             
             else:
                 # RKNN

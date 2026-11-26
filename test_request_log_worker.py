@@ -81,7 +81,7 @@ def test_worker_logs_an_aborted_run(env, caplog):
     first = _task(env, LONG_RUN, "a", "aaaa0001")
     _start_worker(env)
     assert _recv(first) == "a0,"
-    env.abort_flag.value = True
+    first.send(env.worker_mod.WORKER_TASK_ABORT_REQUEST)
     _read_answer(env, first)
     env.worker_thread.join(5)
 

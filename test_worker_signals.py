@@ -54,7 +54,7 @@ def _slow_rkllm_child(env, monkeypatch, ctx, loading):
 
     monkeypatch.setattr(env.FakeRKLLM, "__init__", slow_load)
     return env.worker_mod.run_rkllm_worker, (
-        "failing-model", ctx.Queue(), ctx.Queue(), ctx.Value("b", False), "unused", "unused")
+        "failing-model", ctx.Queue(), ctx.Queue(), "unused", "unused")
 
 
 def _slow_rknn_child(env, monkeypatch, ctx, loading):
