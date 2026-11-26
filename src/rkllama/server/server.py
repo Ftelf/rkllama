@@ -173,7 +173,7 @@ variables.worker_manager_rkllm.set_model_loader(lambda model_name, options: load
 
 def unload_model(model_name):
     # Relese the model from memory
-    variables.worker_manager_rkllm.stop_worker(model_name)
+    variables.worker_manager_rkllm.stop_worker(model_name, reason="api")
 
 
 app = Flask(__name__)
@@ -363,7 +363,7 @@ def unload_model_route():
 # Route to unload a model from the NPU
 @app.route('/unload_models', methods=['POST'])
 def unload_models_route():
-    variables.worker_manager_rkllm.stop_all()
+    variables.worker_manager_rkllm.stop_all(reason="api")
     return jsonify({"message": "Models successfully unloaded!"}), 200
 
 # Route to retrieve the current models
@@ -1069,7 +1069,7 @@ def generate_ollama():
 
         if not prompt:
             # Ollama Unload model Standard when no prompt in generate
-            variables.worker_manager_rkllm.stop_worker(model_name)
+            variables.worker_manager_rkllm.stop_worker(model_name, reason="api")
             return jsonify({"unload": True, "model" : model_name}), 200
 
         # Get Thinking setting from modelfile if not provided
@@ -1547,7 +1547,7 @@ def forward_request_to_llama_cpp_worker(is_openai_request,request):
         prompt = data.get("prompt", None)
         if model_name and not prompt:
             # Ollama Unload model Standard when no prompt in generate
-            variables.worker_manager_rkllm.stop_worker(model_name)
+            variables.worker_manager_rkllm.stop_worker(model_name, reason="api")
             return jsonify({"unload": True, "model" : model_name}), 200
  
     # Llama.cpp require OpenAI format. CHeck if original request came from Ollama format to transformt it

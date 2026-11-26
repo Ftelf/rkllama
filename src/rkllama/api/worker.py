@@ -79,11 +79,21 @@ from datetime import datetime, timedelta
 from.model_utils import context_length_from_options, get_model_size, get_encoder_model_path, get_property_modelfile, is_rkllm_model, is_gguf_model, get_rknn_onnx_files_from_model
 from .classes import *
 from .callback import *
+from .request_log import clean
     
 from operator import attrgetter
 
 
 logger = logging.getLogger("rkllama.worker")
+
+
+def _log_request(request_id, what, model_name):
+    """A line of the request lifecycle (issue #29) in the worker or manager log, tagged with the
+    id of the request. A worker handles one task at a time, so the worker lines between
+    ``run started`` and ``run ended`` of an id belong to that request. No id (a task that
+    does not come from a request): nothing is logged."""
+    if request_id is not None:
+        logger.info("request %s %s model=%s", request_id, what, clean(model_name))
 
 # Worker variables
 WORKER_TASK_UNLOAD_MODEL = "UNLOAD"
@@ -345,11 +355,16 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
         # The model thread of the current task, if it starts one (checked by the error handler below)
         thread_model = None
+        # The request this task belongs to (the optional 7th element of the task), and whether its
+        # ``run started`` line is still waiting for its ``run ended`` line
+        request_id = None
+        run_open = False
 
         try:
         
             # Get the instruction to the worker
-            child_conn, task, inference_mode, model_input_type, model_input, options =  task_queue.get()
+            child_conn, task, inference_mode, model_input_type, model_input, options, *rest =  task_queue.get()
+            request_id = rest[0] if rest else None
 
             if task == WORKER_TASK_UNLOAD_MODEL:
                 logger.info(f"Unloading model {name}...")
@@ -371,6 +386,8 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
             elif task == WORKER_TASK_INFERENCE:
                 logger.info(f"Running inference for model {name}...")
+                _log_request(request_id, "run started task=inference", name)
+                run_open = True
                 # Drop the previous run's metrics: the RKLLM_RUN_FINISH callback refills
                 # them, so an empty list afterwards means this run produced no result
                 global_metrics.clear()
@@ -427,9 +444,12 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                     # the client's end is closed
                     _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name)
                     child_conn.close()
+                    _log_request(request_id, "run ended outcome=client gone", name)
+                    run_open = False
                     continue
 
                 # Check for abort of inference
+                aborted_run = bool(abort_flag.value)
                 if abort_flag.value:
                     # Abort the current inference of the model, wait until it has ended, reset the flag
                     _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name)
@@ -447,6 +467,8 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                     logger.error(f"Inference failed for model {name}: {reason}")
                     _safe_send(child_conn, (WORKER_TASK_ERROR, reason), f"error report for model {name}")
                     child_conn.close()
+                    _log_request(request_id, "run ended outcome=error", name)
+                    run_open = False
                     continue
                 else:
                     # Get the metricts of the inference
@@ -460,10 +482,14 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
                 # Close the connection
                 child_conn.close()
+                _log_request(request_id, f"run ended outcome={'aborted' if aborted_run else 'finished'} tokens={token_count}", name)
+                run_open = False
         
                 
             elif task == WORKER_TASK_EMBEDDING:
                 logger.info(f"Running embedding for model {name}...")
+                _log_request(request_id, "run started task=embedding", name)
+                run_open = True
                 # Run inference
                 thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input, options))
                 thread_model.start()
@@ -481,6 +507,8 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
                     # Close the connection
                     child_conn.close()
+                _log_request(request_id, f"run ended outcome={'finished' if last_embeddings else 'error'}", name)
+                run_open = False
             
             elif task == WORKER_TASK_VISION_ENCODER:
                 logger.info(f"Running vision encoder for model {name}...")
@@ -502,6 +530,8 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
         except Exception as e:
             logger.error(f"Failed executing task the worker for model '{name}': {str(e)}")
+            if run_open:
+                _log_request(request_id, "run ended outcome=error", name)
             # Whatever failed, the run of this task must not go on while the worker takes the next task
             if thread_model is not None and thread_model.is_alive():
                 _stop_rkllm_run(model_rkllm, thread_model, abort_flag, name)
@@ -800,14 +830,22 @@ class TrackedConnection:
     the Worker object (pipe_closed_without_result) so the next request reloads it.
     """
 
-    def __init__(self, conn, release, worker):
+    def __init__(self, conn, release, worker, request_id=None):
         self._conn = conn
+        # The request this pipe belongs to, for its log lines (issue #29)
+        self.request_id = request_id
         self._release = release
         # The worker this request went to, kept even if it is unloaded or replaced meanwhile
         self._worker = worker
         # Only multiprocessing workers have a sentinel; others fall back to a plain poll
         self._sentinel = getattr(worker.process, "sentinel", None)
         self._worker_died = False
+        self._pipe_at_eof = False
+
+    @property
+    def worker_gone(self):
+        """True once this request saw its worker exit or close the pipe without a result."""
+        return self._worker_died or self._pipe_at_eof
 
     def __getattr__(self, name):
         # fileno / closed / ... go to the real connection
@@ -826,6 +864,7 @@ class TrackedConnection:
             self._worker.pipe_closed_without_result = True
             logger.error(f"Worker of model {self._worker.worker_model_info.model} exited "
                          f"(exitcode={self._worker.process.exitcode}) without finishing the request.")
+            _log_request(self.request_id, f"worker exited exitcode={self._worker.process.exitcode}", self._worker.worker_model_info.model)
             return True
         return False
 
@@ -841,6 +880,7 @@ class TrackedConnection:
             # before its process can be reaped (NPU memory teardown), so remember it on this worker object:
             # the next request then reloads the model instead of queueing to the dying worker
             self._worker.pipe_closed_without_result = True
+            self._pipe_at_eof = True
             raise
 
     def request_abort(self):
@@ -1083,6 +1123,7 @@ class WorkerManager:
         except Exception as e:
             logger.warning(f"Could not close the task queue of the dead worker of model {model_name}: {e}")
         if self.workers.get(model_name) is worker:
+            logger.info("Unloading model %s (reason: dead worker)", clean(model_name))
             del self.workers[model_name]
             # Its NPU domain is free now: wake loads waiting for one
             self._workers_cond.notify_all()
@@ -1098,7 +1139,7 @@ class WorkerManager:
         for model_name in expired_models:
             logger.info(f"Detected expired model: {model_name}")
             try:
-                self.stop_worker(model_name)
+                self.stop_worker(model_name, reason="idle")
             except Exception as e:
                 logger.error(f"Failed to stop expired worker {model_name}: {e}")
                 # Ensure the worker entry is cleaned up even if stop_worker
@@ -1234,7 +1275,7 @@ class WorkerManager:
         returns None on success or an error message."""
         self._model_loader = loader
 
-    def load_and_begin_request(self, model_name, options=None):
+    def load_and_begin_request(self, model_name, options=None, request_id=None):
         """Mark a model busy for one request, loading it first if it is not loaded.
 
         Loading and marking busy happen in one hold of self._workers_cond, so a
@@ -1251,16 +1292,21 @@ class WorkerManager:
         """
         with self._workers_cond:
             worker = self.workers.get(model_name)
+            reloaded_after_death = False
             if worker is not None and self._is_worker_dead(worker):
                 self._drop_dead_worker_locked(model_name, worker)
+                reloaded_after_death = model_name not in self.workers
             if model_name not in self.workers:
                 if self._model_loader is None:
                     return f"Model '{model_name}' is not loaded."
+                _log_request(request_id, "loading (reload after a dead worker)" if reloaded_after_death else "loading (not loaded)", model_name)
                 error = self._model_loader(model_name, options)
                 if error:
                     return error
                 if model_name not in self.workers:
                     return f"Model '{model_name}' could not be loaded."
+            else:
+                _log_request(request_id, "model reused", model_name)
             self._busy[model_name] = self._busy.get(model_name, 0) + 1
             return None
 
@@ -1312,7 +1358,7 @@ class WorkerManager:
             victim = self._least_recently_used_idle_llm()
             if victim is not None:
                 logger.info(f"All NPU domains in use: unloading least recently used idle model {victim} to load {model_name}")
-                self.stop_worker(victim)
+                self.stop_worker(victim, reason="slot")
                 continue
 
             remaining = deadline - time.monotonic()
@@ -1376,7 +1422,7 @@ class WorkerManager:
         for worker_rknn_model_info in sorted(worker_rknn_models_info, key=attrgetter('last_call')):
             logger.info(f"Unloading RKNN model {worker_rknn_model_info.model} to gain free memory (at least {memory_required})")
             # Stop the first oldest modelin memory
-            self.stop_worker(worker_rknn_model_info.model)
+            self.stop_worker(worker_rknn_model_info.model, reason="memory")
 
             # Wait a second to refresh memory system
             time.sleep(1)
@@ -1398,7 +1444,7 @@ class WorkerManager:
         for worker_model_info in sorted(worker_models_info, key=attrgetter('last_call')):
             logger.info(f"Unloading model {worker_model_info.model} to gain free memory (at least {memory_required})")
             # Stop the first oldest modelin memory
-            self.stop_worker(worker_model_info.model)
+            self.stop_worker(worker_model_info.model, reason="memory")
 
             # Wait a second to refresh memory system
             time.sleep(1)
@@ -1421,7 +1467,7 @@ class WorkerManager:
             
             logger.info(f"Unloading RKNN model {model_name} to gain free memory in RKNN domain")
             # Stop the RKNN model in memory
-            self.stop_worker(model_name)
+            self.stop_worker(model_name, reason="memory")
 
             # Wait a second to refresh memory system
             time.sleep(1)
@@ -1479,13 +1525,16 @@ class WorkerManager:
 
         return None
 
-    def _send_task_to(self, worker, model_name, task):
-        """send_task to this worker object (not looked up again by model name)."""
+    def _send_task_to(self, worker, model_name, task, request_id=None):
+        """send_task to this worker object (not looked up again by model name).
+        An RKLLM task of a request carries the request id as the optional last element
+        of the tuple (run_rkllm_worker); RKNN workers get no id."""
         # Declare the pipe for the current task to return
         parent_conn, child_conn = Pipe()
 
         # Send the TASK to the model with the task queue and the pipe to send the response
-        worker.task_queue.put((child_conn,) + task)
+        worker.task_queue.put((child_conn,) + task + ((request_id,) if request_id is not None else ()))
+        _log_request(request_id, "queued", model_name)
 
         # Update the worker model info with the invocation
         self.update_last_call_for_model(model_name)
@@ -1494,7 +1543,7 @@ class WorkerManager:
         return parent_conn
 
     
-    def _send_tracked_task(self, model_name, task, before_send=None):
+    def _send_tracked_task(self, model_name, task, before_send=None, request_id=None):
         """send_task for a request whose result the caller reads from the returned
         pipe: the model stays busy until that pipe is closed. ``before_send`` runs
         first inside the busy window (e.g. the vision encoder of a multimodal
@@ -1508,11 +1557,11 @@ class WorkerManager:
             worker = self.workers.get(model_name)
             if worker is None:
                 raise RuntimeError(f"Model '{model_name}' is not loaded. Try again.")
-            parent_conn = self._send_task_to(worker, model_name, task(prepared) if callable(task) else task)
+            parent_conn = self._send_task_to(worker, model_name, task(prepared) if callable(task) else task, request_id)
         except BaseException:
             self.end_request(model_name)
             raise
-        return TrackedConnection(parent_conn, lambda: self.end_request(model_name), worker)
+        return TrackedConnection(parent_conn, lambda: self.end_request(model_name), worker, request_id)
 
     def update_last_call_for_model(self, model_name):
         """
@@ -1549,18 +1598,18 @@ class WorkerManager:
         worker.worker_model_info.expires_at = datetime.now() + timedelta(minutes=int(rkllama.config.get("model", "max_minutes_loaded_in_memory")),)
 
 
-    def stop_worker(self, model_name, timeout=30):
+    def stop_worker(self, model_name, timeout=30, reason=None):
         """
         Stop/Unload a model worker (see _stop_worker_locked). Serialized with
         model loads, and wakes loads waiting for a free NPU domain.
         """
         with self._workers_cond:
             try:
-                self._stop_worker_locked(model_name, timeout)
+                self._stop_worker_locked(model_name, timeout, reason)
             finally:
                 self._workers_cond.notify_all()
 
-    def _stop_worker_locked(self, model_name, timeout=30):
+    def _stop_worker_locked(self, model_name, timeout=30, reason=None):
         """
         Stop/Unload a model worker. Caller must hold self._workers_cond (stop_worker
         takes it). Sends an unload command and waits up to
@@ -1572,11 +1621,14 @@ class WorkerManager:
             model_name (str): Workers to unload.
             timeout (int): Seconds to wait for a graceful shutdown before
                            force-killing the worker process. Default 30.
+            reason (str): Why the model is unloaded (idle, slot, memory, shutdown, api),
+                          for the one lifecycle line of the unload (issue #29).
 
         """
         if model_name not in self.workers:
             return
 
+        logger.info("Unloading model %s (reason: %s)", clean(model_name), reason or "unspecified")
         process = self.workers[model_name].process
         task_queue = self.workers[model_name].task_queue
         
@@ -1623,13 +1675,13 @@ class WorkerManager:
         # Remove the worker from the dictionary
         del self.workers[model_name]
 
-    def stop_all(self):
+    def stop_all(self, reason="shutdown"):
         """
         Send a inference task to the corresponding model worker
         """
         # Loop over all the workers to stop/unload
         for model_name in list(self.workers.keys()):
-            self.stop_worker(model_name)
+            self.stop_worker(model_name, reason=reason)
 
 
     def clear_cache_worker(self, model_name):
@@ -1646,7 +1698,7 @@ class WorkerManager:
             
 
 
-    def inference(self, model_name, prompt_input, prompt_cache_file, options):
+    def inference(self, model_name, prompt_input, prompt_cache_file, options, request_id=None):
         """
         Send a inference task to the corresponding model worker
         
@@ -1663,7 +1715,7 @@ class WorkerManager:
             model_input = (prompt_input, prompt_cache_file)
             
             # Send the inference task (model stays busy until the returned pipe is closed)
-            parent_conn = self._send_tracked_task(model_name, (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_TOKEN, model_input, options))
+            parent_conn = self._send_tracked_task(model_name, (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_TOKEN, model_input, options), request_id=request_id)
             
             # Clear the cache to save memory. Load Prompt caching file is enable before the new inference
             self.clear_cache_worker(model_name)
@@ -1674,7 +1726,7 @@ class WorkerManager:
         raise RuntimeError(f"Model '{model_name}' is not loaded (it may have been unloaded for another model). Try again.")
 
 
-    def embedding(self, model_name, text_input, prompt_cache_file = None, options = None):
+    def embedding(self, model_name, text_input, prompt_cache_file = None, options = None, request_id=None):
         """
         Send a prepare embedding task to the corresponding model worker
         
@@ -1691,14 +1743,14 @@ class WorkerManager:
             model_input = (text_input, prompt_cache_file)
 
             # Send the embedding task
-            parent_conn = self._send_tracked_task(model_name, (WORKER_TASK_EMBEDDING,RKLLMInferMode.RKLLM_INFER_GET_LAST_HIDDEN_LAYER, RKLLMInputType.RKLLM_INPUT_PROMPT, model_input, options))        
+            parent_conn = self._send_tracked_task(model_name, (WORKER_TASK_EMBEDDING,RKLLMInferMode.RKLLM_INFER_GET_LAST_HIDDEN_LAYER, RKLLMInputType.RKLLM_INPUT_PROMPT, model_input, options), request_id=request_id)
             
             # Return the request parent pipe connection
             return parent_conn
 
         raise RuntimeError(f"Model '{model_name}' is not loaded (it may have been unloaded for another model). Try again.")
 
-    def multimodal(self, model_name, prompt_input, images, prompt_cache_file, options, video = None):
+    def multimodal(self, model_name, prompt_input, images, prompt_cache_file, options, video = None, request_id=None):
         """
         Send a inference task to the corresponding model worker for multimodal input
         
@@ -1748,6 +1800,7 @@ class WorkerManager:
                 model_name,
                 lambda model_input: (WORKER_TASK_INFERENCE,RKLLMInferMode.RKLLM_INFER_GENERATE, RKLLMInputType.RKLLM_INPUT_MULTIMODAL, model_input, options),
                 before_send=encode_images,
+                request_id=request_id,
             )
             
             # Clear the cache to save memory. Load Prompt caching file is enable before the new inference
