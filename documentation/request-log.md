@@ -14,7 +14,7 @@ Only categories, numbers and the model name are logged. Prompt text, answer text
 | outcome | meaning |
 |---|---|
 | `finished` | the worker finished the answer |
-| `token limit` | the answer has as many tokens as `max_new_tokens` allows. The worker reports no finish reason, so this is `0 < max_new_tokens <= tokens`; a model that ends by itself on exactly the last allowed token looks the same |
+| `token limit` | the answer was cut by `max_new_tokens`. The worker reports no finish reason, and on RK3588 (rkllm 1.3.x) the runtime counts one token less than the limit at a cut (limits 6, 8, 12, 16 gave 5, 7, 11, 15), so this is `tokens >= max_new_tokens - 1`; a model that ends by itself on exactly that count looks the same |
 | `client gone` | the client closed a streamed answer. Only streams can show it: a non-stream request writes nothing until it is done. `tokens` is what was read so far |
 | `aborted` | the worker cut the run (abort flag) and reported empty stats; the abort did not come from this request's own timeout |
 | `timed out` | no worker message within `max_seconds_waiting_worker_response` |
