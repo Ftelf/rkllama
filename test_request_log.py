@@ -173,7 +173,8 @@ def run_loop(sm, name, stream, manager, options=None):
 @pytest.mark.parametrize("case, ending, final, options, outcome, tokens", [
     ("finished", "finished", (FINISHED, 7, 5, 10, 20), None, "finished", "5"),
     ("token limit", "finished", (FINISHED, 7, 5, 10, 20), {"max_new_tokens": "5"}, "token limit", "5"),
-    ("below the token limit", "finished", (FINISHED, 7, 4, 10, 20), {"max_new_tokens": "5"}, "finished", "4"),
+    ("runtime counts one below the cap: cap 8 gave 7 on the board", "finished", (FINISHED, 7, 7, 10, 20), {"max_new_tokens": "8"}, "token limit", "7"),
+    ("two below the cap is a natural end", "finished", (FINISHED, 7, 3, 10, 20), {"max_new_tokens": "5"}, "finished", "3"),
     ("limit 0 means the runtime default: no claim", "finished", (FINISHED, 7, 5, 10, 20), {"max_new_tokens": "0"}, "finished", "5"),
     ("aborted", "aborted", None, None, "aborted", "0"),
     ("worker error", "error", None, None, "error", "-"),

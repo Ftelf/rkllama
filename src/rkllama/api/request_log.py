@@ -41,15 +41,17 @@ def clean(value):
 
 
 def hit_token_limit(options, token_count):
-    """True if the answer has as many tokens as the request's max_new_tokens allows.
+    """True if the answer was cut by the request's max_new_tokens.
 
-    Decided here because the worker reports no finish reason. A model that ends by
-    itself on exactly the last allowed token cannot be told apart. A limit of 0 or
-    less means "the runtime's load-time value", which is not known here, so it
-    claims nothing."""
+    Decided here because the worker reports no finish reason. On RK3588 (rkllm runtime
+    1.3.x, measured with rk-sbox run 20261126T120151Z) the runtime's token count of a
+    cut answer is max_new_tokens - 1: limits of 6, 8, 12 and 16 gave counts of 5, 7, 11
+    and 15. So the test is ``token_count >= max_new_tokens - 1``. A model that ends by
+    itself on exactly that count cannot be told apart. A limit of 0 or less means "the
+    runtime's load-time value", which is not known here, so it claims nothing."""
     try:
         limit = int((options or {}).get("max_new_tokens"))
-        return 0 < limit <= int(token_count)
+        return limit > 0 and int(token_count) >= limit - 1
     except (TypeError, ValueError):
         return False
 
