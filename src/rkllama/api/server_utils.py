@@ -14,6 +14,8 @@ from flask import jsonify, Response, stream_with_context
 from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, extract_tool_calls, handle_ollama_response, handle_ollama_embedding_response, get_base64_image_from_pil, get_url_image_from_pil
 from .model_utils import get_property_modelfile, context_length_from_options, prompt_too_long_message
 from .worker import ModelSlotsBusy
+from .request_log import (RequestTrace, NULL_TRACE, traced_stream, outcome_of_final_stats,
+                          TIMED_OUT, WORKER_DEAD, ERROR, FINISHED)
 import rkllama.config
 
 # Check for debug mode using the improved method from config
@@ -32,12 +34,12 @@ logging.basicConfig(
 logger = logging.getLogger("rkllama.server_utils")
 
 
-def load_and_begin_request_or_error(model_name, options=None):
+def load_and_begin_request_or_error(model_name, options=None, request_id=None):
     """WorkerManager.load_and_begin_request as an HTTP outcome: None when the model is
     loaded and marked busy (the caller must end_request), else the error response:
     503 if no model slot freed up in time, 500 if the load failed."""
     try:
-        error = variables.worker_manager_rkllm.load_and_begin_request(model_name, options)
+        error = variables.worker_manager_rkllm.load_and_begin_request(model_name, options, request_id=request_id)
     except ModelSlotsBusy as e:
         return jsonify({"error": str(e)}), 503
     if error:
@@ -45,25 +47,40 @@ def load_and_begin_request_or_error(model_name, options=None):
     return None
 
 
-def _with_loaded_model(handle_request):
+def _with_loaded_model(endpoint):
     """Load the model if needed and keep it marked busy for the whole request,
     prompt preparation (tokenization) included, so a concurrent load of another
     model cannot unload it to free an NPU domain before its task reaches the
     worker. A model that is not loaded, or was unloaded for another one, is loaded
     here (WorkerManager.load_and_begin_request); failures become HTTP 503 / 500.
     The worker pipe holds its own busy mark until it is closed, which covers
-    streamed responses that outlive this call."""
-    @functools.wraps(handle_request)
-    def wrapper(cls, model_name, *args, **kwargs):
-        manager = variables.worker_manager_rkllm
-        error_response = load_and_begin_request_or_error(model_name, kwargs.get("options"))
-        if error_response:
-            return error_response
-        try:
-            return handle_request(cls, model_name, *args, **kwargs)
-        finally:
-            manager.end_request(model_name)
-    return wrapper
+    streamed responses that outlive this call.
+
+    Also owns the request's trace (request_log.RequestTrace, ``endpoint`` is its
+    label): the start line first, the end line when the handler is done. A streamed
+    answer outlives this call, so its generator ends the trace instead."""
+    def decorator(handle_request):
+        @functools.wraps(handle_request)
+        def wrapper(cls, model_name, *args, **kwargs):
+            manager = variables.worker_manager_rkllm
+            trace = RequestTrace(endpoint, model_name, "openai" if kwargs.get("is_openai_request") else "ollama")
+            trace.start()
+            error_response = load_and_begin_request_or_error(model_name, kwargs.get("options"), request_id=trace.id)
+            if error_response:
+                trace.end(ERROR)
+                return error_response
+            try:
+                result = handle_request(cls, model_name, *args, _trace=trace, **kwargs)
+            except BaseException:
+                trace.end(ERROR)
+                raise
+            finally:
+                manager.end_request(model_name)
+            if not trace.owned_by_stream:
+                trace.end()
+            return result
+        return wrapper
+    return decorator
 
 
 class RequestWrapper:
@@ -307,9 +324,10 @@ class ChatEndpointHandler(EndpointHandler):
         return response
         
     @classmethod
-    @_with_loaded_model
-    def handle_request(cls, model_name, messages, system="", stream=True, format_spec=None, options=None, tools=None, enable_thinking=False, is_openai_request=False, images=None):
+    @_with_loaded_model("chat")
+    def handle_request(cls, model_name, messages, system="", stream=True, format_spec=None, options=None, tools=None, enable_thinking=False, is_openai_request=False, images=None, _trace=None):
         """Process a chat request with proper format handling"""
+        trace = _trace if _trace is not None else NULL_TRACE
         
         original_system = variables.system
         if system:
@@ -353,7 +371,7 @@ class ChatEndpointHandler(EndpointHandler):
             # Ollama request handling 
             if stream:
                 ollama_chunk = cls.handle_streaming(model_name, final_prompt, 
-                                          format_spec, tools, enable_thinking, images, prompt_cache_file, options)
+                                          format_spec, tools, enable_thinking, images, prompt_cache_file, options, trace)
                 if is_openai_request:
 
                     # Use unified handler
@@ -366,7 +384,7 @@ class ChatEndpointHandler(EndpointHandler):
                 return ollama_chunk
             else:
                 ollama_response, code =  cls.handle_complete(model_name, final_prompt, 
-                                         format_spec, tools, enable_thinking,images, prompt_cache_file, options)
+                                         format_spec, tools, enable_thinking,images, prompt_cache_file, options, trace)
                 
                 if is_openai_request and code == 200:
                     # Convert Ollama response to OpenAI format
@@ -379,16 +397,17 @@ class ChatEndpointHandler(EndpointHandler):
             variables.system = original_system
             
     @classmethod
-    def handle_streaming(cls, model_name, final_prompt, format_spec, tools, enable_thinking, images=None, prompt_cache_file = None, options = None):
+    def handle_streaming(cls, model_name, final_prompt, format_spec, tools, enable_thinking, images=None, prompt_cache_file = None, options = None, _trace=None):
         """Handle streaming chat response"""
+        trace = _trace if _trace is not None else NULL_TRACE
 
         # Check if multimodal or text only
         if not images:
             # Send the task of inference to the model
-            parent_pipe = variables.worker_manager_rkllm.inference(model_name, final_prompt, prompt_cache_file, options)
+            parent_pipe = variables.worker_manager_rkllm.inference(model_name, final_prompt, prompt_cache_file, options, request_id=trace.id)
         else:
             # Send the task of multimodal inference to the model
-            parent_pipe = variables.worker_manager_rkllm.multimodal(model_name, final_prompt, images, prompt_cache_file, options)
+            parent_pipe = variables.worker_manager_rkllm.multimodal(model_name, final_prompt, images, prompt_cache_file, options, request_id=trace.id)
         
         # Get timeout
         timeout = int(rkllama.config.get("model", "max_seconds_waiting_worker_response"))
@@ -429,6 +448,7 @@ class ChatEndpointHandler(EndpointHandler):
                 else:
                     # Abort the current inference
                     parent_pipe.request_abort()
+                    trace.set_outcome(TIMED_OUT)
                     
                     # Raise Exception
                     logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
@@ -445,6 +465,7 @@ class ChatEndpointHandler(EndpointHandler):
                 # Worker reported an error (e.g. prompt longer than the context): end the stream with it
                 worker_error = worker_error_message(token)
                 if worker_error is not None:
+                    trace.set_outcome(WORKER_DEAD if getattr(parent_pipe, "worker_gone", False) else ERROR)
                     logger.error(f"Inference failed for model {model_name}: {worker_error}")
                     parent_pipe.close()
                     yield f"{json.dumps({'error': worker_error})}\n"
@@ -455,12 +476,15 @@ class ChatEndpointHandler(EndpointHandler):
                     thread_finished = True
                     # Get the stats from the inference
                     _, prompt_token_count, token_count, prompt_eval, eval = token
+                    trace.tokens = token_count
+                    trace.set_outcome(outcome_of_final_stats(options, prompt_token_count, token_count, prompt_eval, eval))
 
                     # CLose the parent pipe
                     parent_pipe.close()
             
                 if not thread_finished:
                     count += 1
+                    trace.tokens = count
                     
                     if count == 1:
                         prompt_eval_time = time.time()
@@ -558,7 +582,9 @@ class ChatEndpointHandler(EndpointHandler):
                     final_chunk = cls.format_streaming_chunk(model_name=model_name, token="", is_final=True, metrics=metrics, format_data=format_data,tool_calls=tool_calls)
                     yield f"{json.dumps(final_chunk)}\n"
                     
-        return Response(generate(), content_type='application/x-ndjson')
+        # The generator ends the trace: when the answer is over, or when the server closes it because the client left
+        trace.owned_by_stream = True
+        return Response(traced_stream(trace, generate()), content_type='application/x-ndjson')
     
 
     @staticmethod
@@ -574,8 +600,9 @@ class ChatEndpointHandler(EndpointHandler):
         return text[end + len("</think>"):] if end >= 0 else ""
 
     @classmethod
-    def handle_complete(cls, model_name, final_prompt, format_spec, tools, enable_thinking, images=None, prompt_cache_file = None, options = None):
+    def handle_complete(cls, model_name, final_prompt, format_spec, tools, enable_thinking, images=None, prompt_cache_file = None, options = None, _trace=None):
         """Handle complete non-streaming chat response"""
+        trace = _trace if _trace is not None else NULL_TRACE
         
         start_time = time.time()
         prompt_eval_time = None
@@ -591,10 +618,10 @@ class ChatEndpointHandler(EndpointHandler):
         # Check if multimodal or text only
         if not images:
             # Send the task of inference to the model
-            parent_pipe = variables.worker_manager_rkllm.inference(model_name, final_prompt, prompt_cache_file, options)
+            parent_pipe = variables.worker_manager_rkllm.inference(model_name, final_prompt, prompt_cache_file, options, request_id=trace.id)
         else:
             # Send the task of multimodal inference to the model
-            parent_pipe = variables.worker_manager_rkllm.multimodal(model_name, final_prompt, images, prompt_cache_file, options)
+            parent_pipe = variables.worker_manager_rkllm.multimodal(model_name, final_prompt, images, prompt_cache_file, options, request_id=trace.id)
 
         # Get timeout
         timeout = int(rkllama.config.get("model", "max_seconds_waiting_worker_response"))
@@ -606,6 +633,7 @@ class ChatEndpointHandler(EndpointHandler):
 
                 # Abort the current inference
                 parent_pipe.request_abort()
+                trace.set_outcome(TIMED_OUT)
 
                 # Raise Exception
                 logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
@@ -622,6 +650,7 @@ class ChatEndpointHandler(EndpointHandler):
             # Worker reported an error (e.g. prompt longer than the context)
             worker_error = worker_error_message(token)
             if worker_error is not None:
+                trace.set_outcome(WORKER_DEAD if getattr(parent_pipe, "worker_gone", False) else ERROR)
                 logger.error(f"Inference failed for model {model_name}: {worker_error}")
                 parent_pipe.close()
                 return jsonify({"error": worker_error}), 500
@@ -631,6 +660,8 @@ class ChatEndpointHandler(EndpointHandler):
                 thread_finished = True
                 # Get the stats from the inference
                 _, prompt_token_count, token_count, prompt_eval, eval = token
+                trace.tokens = token_count
+                trace.set_outcome(outcome_of_final_stats(options, prompt_token_count, token_count, prompt_eval, eval))
 
                 # Close the parent pipe
                 parent_pipe.close()
@@ -639,6 +670,7 @@ class ChatEndpointHandler(EndpointHandler):
                 continue
             
             count += 1
+            trace.tokens = count
             if count == 1:
                 prompt_eval_time = time.time()
 
@@ -741,9 +773,10 @@ class GenerateEndpointHandler(EndpointHandler):
         return response
     
     @classmethod
-    @_with_loaded_model
-    def handle_request(cls, model_name, prompt, system="", stream=True, format_spec=None, options=None,enable_thinking=False, is_openai_request=False, images=None):
+    @_with_loaded_model("generate")
+    def handle_request(cls, model_name, prompt, system="", stream=True, format_spec=None, options=None,enable_thinking=False, is_openai_request=False, images=None, _trace=None):
         """Process a generate request with proper format handling"""
+        trace = _trace if _trace is not None else NULL_TRACE
         messages = [{"role": "user", "content": prompt}]
         
         original_system = variables.system
@@ -789,7 +822,7 @@ class GenerateEndpointHandler(EndpointHandler):
             # Ollama request handling 
             if stream:
                 ollama_chunk = cls.handle_streaming(model_name, final_prompt, 
-                                           format_spec, enable_thinking, images, None, options) # No cache for generation (it is not a chat conversation)
+                                           format_spec, enable_thinking, images, None, options, trace) # No cache for generation (it is not a chat conversation)
                 if is_openai_request:
 
                     # Use unified handler
@@ -802,7 +835,7 @@ class GenerateEndpointHandler(EndpointHandler):
                 return ollama_chunk
             else:
                 ollama_response, code =  cls.handle_complete(model_name, final_prompt, 
-                                          format_spec, enable_thinking, images, None, options) # No cache for generation (it is not a chat conversation)
+                                          format_spec, enable_thinking, images, None, options, trace) # No cache for generation (it is not a chat conversation)
                 
                 if is_openai_request and code == 200:
                     # Convert Ollama response to OpenAI format
@@ -815,16 +848,17 @@ class GenerateEndpointHandler(EndpointHandler):
             variables.system = original_system
     
     @classmethod
-    def handle_streaming(cls, model_name, final_prompt, format_spec, enable_thinking, images=None, prompt_cache_file = None, options = None):
+    def handle_streaming(cls, model_name, final_prompt, format_spec, enable_thinking, images=None, prompt_cache_file = None, options = None, _trace=None):
         """Handle streaming generate response"""
+        trace = _trace if _trace is not None else NULL_TRACE
 
         # Check if multimodal or text only
         if not images:
             # Send the task of inference to the model
-            parent_pipe = variables.worker_manager_rkllm.inference(model_name, final_prompt, prompt_cache_file, options)
+            parent_pipe = variables.worker_manager_rkllm.inference(model_name, final_prompt, prompt_cache_file, options, request_id=trace.id)
         else:
             # Send the task of multimodal inference to the model
-            parent_pipe = variables.worker_manager_rkllm.multimodal(model_name, final_prompt, images, prompt_cache_file, options)
+            parent_pipe = variables.worker_manager_rkllm.multimodal(model_name, final_prompt, images, prompt_cache_file, options, request_id=trace.id)
         
         # Get Timeout
         timeout = int(rkllama.config.get("model", "max_seconds_waiting_worker_response"))
@@ -854,6 +888,7 @@ class GenerateEndpointHandler(EndpointHandler):
                 else:
                     # Abort the current inference
                     parent_pipe.request_abort()
+                    trace.set_outcome(TIMED_OUT)
                     
                     # Raise Exception
                     logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
@@ -870,6 +905,7 @@ class GenerateEndpointHandler(EndpointHandler):
                 # Worker reported an error (e.g. prompt longer than the context): end the stream with it
                 worker_error = worker_error_message(token)
                 if worker_error is not None:
+                    trace.set_outcome(WORKER_DEAD if getattr(parent_pipe, "worker_gone", False) else ERROR)
                     logger.error(f"Inference failed for model {model_name}: {worker_error}")
                     parent_pipe.close()
                     yield f"{json.dumps({'error': worker_error})}\n"
@@ -880,12 +916,15 @@ class GenerateEndpointHandler(EndpointHandler):
                     thread_finished = True
                     # Get the stats from the inference
                     _, prompt_token_count, token_count, prompt_eval, eval = token
+                    trace.tokens = token_count
+                    trace.set_outcome(outcome_of_final_stats(options, prompt_token_count, token_count, prompt_eval, eval))
 
                     # Close the parent pipe
                     parent_pipe.close()
                 
                 if not thread_finished:
                     count += 1
+                    trace.tokens = count
 
 
                     if count == 1:
@@ -928,11 +967,14 @@ class GenerateEndpointHandler(EndpointHandler):
                     yield f"{json.dumps(final_chunk)}\n"
                 
                     
-        return Response(generate(), content_type='application/x-ndjson')
+        # The generator ends the trace: when the answer is over, or when the server closes it because the client left
+        trace.owned_by_stream = True
+        return Response(traced_stream(trace, generate()), content_type='application/x-ndjson')
     
     @classmethod
-    def handle_complete(cls, model_name, final_prompt, format_spec, enable_thinking, images=None, prompt_cache_file = None, options = None):
+    def handle_complete(cls, model_name, final_prompt, format_spec, enable_thinking, images=None, prompt_cache_file = None, options = None, _trace=None):
         """Handle complete generate response"""
+        trace = _trace if _trace is not None else NULL_TRACE
 
         start_time = time.time()
         prompt_eval_time = None
@@ -948,10 +990,10 @@ class GenerateEndpointHandler(EndpointHandler):
         # Check if multimodal or text only
         if not images:
             # Send the task of inference to the model
-            parent_pipe = variables.worker_manager_rkllm.inference(model_name, final_prompt, prompt_cache_file, options)
+            parent_pipe = variables.worker_manager_rkllm.inference(model_name, final_prompt, prompt_cache_file, options, request_id=trace.id)
         else:
             # Send the task of multimodal inference to the model
-            parent_pipe = variables.worker_manager_rkllm.multimodal(model_name, final_prompt, images, prompt_cache_file, options)
+            parent_pipe = variables.worker_manager_rkllm.multimodal(model_name, final_prompt, images, prompt_cache_file, options, request_id=trace.id)
         
         # Get timeout 
         timeout = int(rkllama.config.get("model", "max_seconds_waiting_worker_response"))
@@ -962,6 +1004,7 @@ class GenerateEndpointHandler(EndpointHandler):
             else:
                 # Abort the current inference
                 parent_pipe.request_abort()
+                trace.set_outcome(TIMED_OUT)
                 
                 # Raise Exception
                 logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
@@ -978,6 +1021,7 @@ class GenerateEndpointHandler(EndpointHandler):
             # Worker reported an error (e.g. prompt longer than the context)
             worker_error = worker_error_message(token)
             if worker_error is not None:
+                trace.set_outcome(WORKER_DEAD if getattr(parent_pipe, "worker_gone", False) else ERROR)
                 logger.error(f"Inference failed for model {model_name}: {worker_error}")
                 parent_pipe.close()
                 return jsonify({"error": worker_error}), 500
@@ -987,6 +1031,8 @@ class GenerateEndpointHandler(EndpointHandler):
                 thread_finished = True
                 # Get the stats from the inference
                 _, prompt_token_count, token_count, prompt_eval, eval = token
+                trace.tokens = token_count
+                trace.set_outcome(outcome_of_final_stats(options, prompt_token_count, token_count, prompt_eval, eval))
 
                 # Close the parent pipe
                 parent_pipe.close()
@@ -995,6 +1041,7 @@ class GenerateEndpointHandler(EndpointHandler):
                 continue
             
             count += 1
+            trace.tokens = count
             if count == 1:
                 prompt_eval_time = time.time()
 
@@ -1107,9 +1154,10 @@ class EmbedEndpointHandler(EndpointHandler):
         return response
     
     @classmethod
-    @_with_loaded_model
-    def handle_request(cls, model_name, input_text, truncate=True, keep_alive=None, options=None, is_openai_request=False):
+    @_with_loaded_model("embed")
+    def handle_request(cls, model_name, input_text, truncate=True, keep_alive=None, options=None, is_openai_request=False, _trace=None):
         """Process a generate request with proper format handling"""
+        trace = _trace if _trace is not None else NULL_TRACE
 
         if DEBUG_MODE:
             logger.debug(f"EmbedEndpointHandler: processing request for {model_name}")
@@ -1119,7 +1167,7 @@ class EmbedEndpointHandler(EndpointHandler):
         logger.debug(f"Skipping tokenization for embedding")
 
         # Ollama request handling 
-        ollama_response, code =  cls.handle_complete(model_name, input_text, options)
+        ollama_response, code =  cls.handle_complete(model_name, input_text, options, trace)
         
         if is_openai_request:
             # Convert Ollama response to OpenAI format
@@ -1130,8 +1178,9 @@ class EmbedEndpointHandler(EndpointHandler):
     
     
     @classmethod
-    def handle_complete(cls, model_name, input_text, options):
+    def handle_complete(cls, model_name, input_text, options, _trace=None):
         """Handle complete embedding response"""
+        trace = _trace if _trace is not None else NULL_TRACE
 
         start_time = time.time()
         prompt_eval_time = None
@@ -1153,17 +1202,22 @@ class EmbedEndpointHandler(EndpointHandler):
         for input in all_inputs:
             
             # Send the task of embedding to the model
-            parent_pipe = variables.worker_manager_rkllm.embedding(model_name, input, None, options)
+            parent_pipe = variables.worker_manager_rkllm.embedding(model_name, input, None, options, request_id=trace.id)
 
             # Get timeout
             timeout = int(rkllama.config.get("model", "max_seconds_waiting_worker_response"))
 
             # Wait for the last_embedding hidden layer return
             if parent_pipe.poll(timeout):  # Timeout in seconds
-                last_embeddings = parent_pipe.recv()
+                try:
+                    last_embeddings = parent_pipe.recv()
+                except (EOFError, OSError):
+                    trace.set_outcome(WORKER_DEAD)
+                    raise
             else:
                 # Abort the current inference
                 parent_pipe.request_abort()
+                trace.set_outcome(TIMED_OUT)
                 # Raise Exception
                 logger.error(f"No response received by the Worker of the model {model_name} in {timeout} seconds.")
                 # Send empty embedding
@@ -1182,6 +1236,9 @@ class EmbedEndpointHandler(EndpointHandler):
             # Increase the number of tokens
             total_tokens= total_tokens + last_embeddings["num_tokens"]
             
+        trace.tokens = total_tokens
+        trace.set_outcome(FINISHED)
+
         # Calculate metrics
         metrics = cls.calculate_durations(start_time, prompt_eval_time)
         metrics["prompt_tokens"] = total_tokens
