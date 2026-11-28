@@ -72,6 +72,7 @@ def _install_fakes():
     sys.modules["rkllama.api.callback"] = callback_mod
 
     class FakeRKLLM:
+        runs_started = 0  # as RKLLM.runs_started (issue #39)
         """Stands in for the real ctypes-backed model. `run()` is invoked
         on a background thread by `run_rkllm_worker`, exactly like the
         real `RKLLM.run`, it just sleeps instead of calling the NPU, then
@@ -87,6 +88,7 @@ def _install_fakes():
             pass
 
         def run(self, inference_mode, model_input_type, model_input, options):
+            self.runs_started += 1
             time.sleep(self.run_duration)
             metrics = callback_mod.global_metrics
             metrics.clear()

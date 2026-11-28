@@ -71,13 +71,18 @@ class _Runtime:
 
 def _fake_rkllm_class(runtime, callback):
     class FakeRKLLM:
+        runs_started = 0  # as RKLLM.runs_started (issue #39)
         def __init__(self, *args, **kwargs):
             self._abort = threading.Event()
             self._idle_abort = False  # sticky: abort() while no run was active
             runtime.instances.append(self)
 
         def run(self, inference_mode, model_input_type, model_input, options):
+            self.runs_started += 1
             n_tokens, tag = model_input
+            if isinstance(n_tokens, list):
+                # The worker's reset run after an embedding (issue #39): token ids, no tag
+                n_tokens, tag = len(n_tokens), "reset"
             record = {"tag": tag, "produced": 0, "aborted": False}
             self._abort.clear()
             with runtime.cond:
@@ -407,10 +412,12 @@ def _callback_driven_rkllm_class(callback_mod, classes, partial_sent):
         callback_mod.callback_impl(ctypes.pointer(result), None, status)
 
     class CallbackDrivenRKLLM:
+        runs_started = 0  # as RKLLM.runs_started (issue #39)
         def __init__(self, *args, **kwargs):
             self._abort = threading.Event()
 
         def run(self, inference_mode, model_input_type, model_input, options):
+            self.runs_started += 1
             tokens, wait_for_abort = model_input
             self._abort.clear()
             for token in tokens:

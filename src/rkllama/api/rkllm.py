@@ -8,6 +8,9 @@ logger = logging.getLogger("rkllama.rkllm")
 
 # Define the RKLLM class, which includes initialization, inference, and release operations for the RKLLM model in the dynamic library
 class RKLLM(object):
+    # Calls of rkllm_run so far: the worker tells from it whether a run reached the runtime (issue #39)
+    runs_started = 0
+
     def __init__(self, callback, model_path, model_dir, options=None, lora_model_path = None, prompt_cache_path = None, base_domain_id = 1):
         
         logger.debug(f"Initializing RKLLM model from {model_path} with options: {options}")
@@ -326,6 +329,7 @@ class RKLLM(object):
 
         # Run the RKLLM model with the input
         logger.debug(f"Executing rkllm inference...")
+        self.runs_started += 1
         ret = self.rkllm_run(self.handle, ctypes.byref(rkllm_input), ctypes.byref(self.rkllm_infer_params), None)
         logger.debug(f"Finished inference (rkllm_run returned {ret})")
         if ret != 0:

@@ -201,6 +201,43 @@ def _skip_task(conn, request_id, requester_signal, name, final_message=None):
     _log_request(request_id, f"run skipped outcome={outcome}", name)
 
 
+# Token count of an embedding whose vector did not come back: its length is not known
+EMBEDDING_TOKENS_UNKNOWN = -1
+
+
+def _needs_reset_after_embedding(embedding_tokens, model_input_type, model_input):
+    """True if this inference must not be the next run after the embedding of
+    ``embedding_tokens`` tokens (None: the last run was not an embedding).
+
+    On RK3588 (RKLLM runtime 1.3.1, issue #39) a generate whose prompt has exactly as
+    many tokens as the embedding run right before it fails the runtime's assertion
+    ``RKLLM_ASSERT(lctx.inp_out_ids ...)`` and the worker dies (SIGABRT). The text and
+    the KV cache do not matter; any run of another length in between prevents it.
+    A multimodal prompt's length is not known here, so it always counts as a match."""
+    if embedding_tokens is None:
+        return False
+    if model_input_type != RKLLMInputType.RKLLM_INPUT_TOKEN:
+        return True
+    return embedding_tokens in (EMBEDDING_TOKENS_UNKNOWN, len(model_input[0]))
+
+
+def _reset_after_embedding(model_rkllm, name, prompt_tokens, last_embeddings):
+    """Put a short hidden-layer run of another length between the embedding and the
+    inference (issue #39), with an empty KV cache before and after it. Its result
+    is dropped. ``prompt_tokens`` is the length of the inference's prompt (None if
+    unknown); the reset run never has that length."""
+    started = time.monotonic()
+    reset_tokens = [0] * (3 if prompt_tokens == 2 else 2)  # token id 0 exists in every vocabulary
+    embeddings_before = len(last_embeddings)
+    model_rkllm.clear_cache()
+    model_rkllm.run(RKLLMInferMode.RKLLM_INFER_GET_LAST_HIDDEN_LAYER, RKLLMInputType.RKLLM_INPUT_TOKEN,
+                    (reset_tokens, None), None)
+    del last_embeddings[embeddings_before:]
+    model_rkllm.clear_cache()
+    logger.info(f"Reset run of model {name} after an embedding of the same length: "
+                f"{len(reset_tokens)} tokens, {int((time.monotonic() - started) * 1000)} ms")
+
+
 def _stop_rkllm_run(model_rkllm, thread_model, name):
     """Stop the run of ``thread_model`` and wait until it has ended, so the next
     task (CLEAR_CACHE, the next INFERENCE) never uses the runtime handle while a
@@ -388,6 +425,11 @@ def run_rkllm_worker(name, task_queue, result_queue, model_path, model_dir, opti
         result_queue.put(WORKER_TASK_ERROR)
         return
 
+    # Token count of the last embedding and the handle's run count right after it: an inference
+    # of the same length must not be the next run on the handle (issue #39)
+    embedding_tokens = None
+    embedding_run = None
+
     # Loop to wait for tasks
     while True:
 
@@ -431,6 +473,15 @@ def run_rkllm_worker(name, task_queue, result_queue, model_path, model_dir, opti
                 logger.info(f"Running inference for model {name}...")
                 _log_request(request_id, "run started task=inference", name)
                 run_open = True
+                # The embedding counts only while it is still the last run on the handle (a run
+                # in between, even one that failed, changed the handle's state; a prompt rejected
+                # before rkllm_run did not)
+                if embedding_tokens is not None and model_rkllm.runs_started != embedding_run:
+                    embedding_tokens = None
+                if _needs_reset_after_embedding(embedding_tokens, model_input_type, model_input):
+                    prompt_tokens = len(model_input[0]) if model_input_type == RKLLMInputType.RKLLM_INPUT_TOKEN else None
+                    _reset_after_embedding(model_rkllm, name, prompt_tokens, last_embeddings)
+                    embedding_tokens = None
                 # Drop the previous run's metrics: the RKLLM_RUN_FINISH callback refills
                 # them, so an empty list afterwards means this run produced no result
                 global_metrics.clear()
@@ -542,16 +593,22 @@ def run_rkllm_worker(name, task_queue, result_queue, model_path, model_dir, opti
                 logger.info(f"Running embedding for model {name}...")
                 _log_request(request_id, "run started task=embedding", name)
                 run_open = True
+                embeddings_before = len(last_embeddings)
                 # Run inference
                 thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input, options))
                 thread_model.start()
-                
+
                 # Looping until execution of the thread finished
                 thread_finished = False
                 while not thread_finished:
-                    # Update status of the thread    
+                    # Update status of the thread
                     thread_model.join(timeout=0.005)
                     thread_finished = not thread_model.is_alive()
+
+                # Its length decides whether the next inference needs a reset run first (issue #39)
+                embedding_tokens = (last_embeddings[-1]["num_tokens"] if len(last_embeddings) > embeddings_before
+                                    else EMBEDDING_TOKENS_UNKNOWN)
+                embedding_run = model_rkllm.runs_started
 
                 if last_embeddings:
                     # Send the embedding shapes of the input
